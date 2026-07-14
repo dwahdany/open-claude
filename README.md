@@ -30,13 +30,13 @@ agent, prompts, tools, and permission model.
 One-liner (server + TUI in one command):
 
 ```sh
-bunx open-claude --attach
+bunx @dwahdany/open-claude --attach
 ```
 
 Or run the server standalone and attach any opencode client to it:
 
 ```sh
-bunx open-claude --port 4096 --directory /path/to/your/project
+bunx @dwahdany/open-claude --port 4096 --directory /path/to/your/project
 # in another terminal:
 opencode attach http://localhost:4096
 ```

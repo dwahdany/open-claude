@@ -1,6 +1,9 @@
 {
-  "name": "open-claude",
+  "name": "@dwahdany/open-claude",
   "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Run the opencode TUI on a Claude Code backend — an opencode v1.17.19 API server over the Claude Agent SDK",
   "type": "module",
   "license": "MIT",
