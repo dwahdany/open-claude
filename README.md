@@ -27,16 +27,26 @@ agent, prompts, tools, and permission model.
 
 ## Usage
 
+One-liner (server + TUI in one command):
+
 ```sh
-bun install
-bun run start -- --port 4096 --directory /path/to/your/project
+bunx open-claude --attach
+```
+
+Or run the server standalone and attach any opencode client to it:
+
+```sh
+bunx open-claude --port 4096 --directory /path/to/your/project
 # in another terminal:
 opencode attach http://localhost:4096
 ```
 
+From a checkout: `bun install && bun run start -- --port 4096`.
+
 `--directory` is the working directory the Claude Code agent operates in (defaults to the
 shim's cwd). Then use the opencode TUI exactly as normal: type prompts, watch streaming
-text and tool calls, approve/deny permission prompts.
+text and tool calls, approve/deny permission prompts. First `bunx` run downloads the
+bundled Claude Code engine (~230MB, cached); later runs start instantly.
 
 ### Config
 

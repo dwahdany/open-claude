@@ -1,11 +1,33 @@
 {
   "name": "open-claude",
-  "module": "index.ts",
+  "version": "0.1.0",
+  "description": "Run the opencode TUI on a Claude Code backend — an opencode v1.17.19 API server over the Claude Agent SDK",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "bin": {
+    "open-claude": "bin/open-claude.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "index.ts",
+    "README.md"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "opencode",
+    "tui",
+    "agent",
+    "anthropic"
+  ],
+  "engines": {
+    "bun": ">=1.3.0"
+  },
   "scripts": {
     "start": "bun run index.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "@opencode-ai/sdk": "1.17.19",
@@ -15,7 +37,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.207",
+    "@anthropic-ai/claude-agent-sdk": "0.3.207",
     "hono": "^4.12.30"
   }
 }
