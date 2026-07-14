@@ -15,6 +15,7 @@ const NAME_MAP: Record<string, string> = {
   TodoWrite: "todowrite",
   Task: "task",
   Agent: "task",
+  Workflow: "task",
   WebFetch: "webfetch",
   WebSearch: "websearch",
   AskUserQuestion: "question",
@@ -47,10 +48,23 @@ export function mapToolInput(name: string, input: Record<string, unknown>): Reco
       rename("replace_all", "replaceAll")
       break
     case "task":
-      // description/subagent_type already match what the TUI reads.
+      // description/subagent_type already match what the TUI reads. Workflow input has
+      // neither, so synthesize them for the Task renderer.
+      if (name === "Workflow") {
+        out.subagent_type = "workflow"
+        if (!out.description) out.description = workflowDisplayName(out)
+      }
       break
   }
   return out
+}
+
+/** Best display name for a Workflow invocation: input.name, else meta.name from the script. */
+function workflowDisplayName(input: Record<string, unknown>): string {
+  if (typeof input.name === "string" && input.name) return input.name
+  const script = typeof input.script === "string" ? input.script : ""
+  const m = script.match(/name\s*:\s*['"`]([^'"`]+)['"`]/)
+  return m?.[1] ?? "workflow"
 }
 
 /** A short human title for a running/completed tool, shown in spinner + block headers. */

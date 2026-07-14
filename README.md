@@ -64,6 +64,10 @@ text and tool calls, approve/deny permission prompts.
 - **Subagents**: Task/Agent runs (and workflow-spawned agents with a spawning tool call) mirror
   into opencode **child sessions** — the task tool part links via `metadata.sessionId`, so the
   TUI shows live progress and "view subagents" navigates into the child transcript.
+- **Workflows**: `Workflow` tool runs render through the same Task view — spinner + live
+  phase/agent line while running, and a child session containing a progress log
+  (`task_progress` ticks, with `agentProgressSummaries` AI status lines, closed by the
+  completion summary). Requires the account-gated Workflows feature.
 - **Questions**: `AskUserQuestion` maps to opencode's question dialog; selected labels return
   to the model via `updatedInput.answers`.
 - Session hydration: reopening a session replays its transcript.
@@ -75,6 +79,8 @@ text and tool calls, approve/deny permission prompts.
 - `test/subagent-session.ts` — Task subagent → child session over SSE, task part linked via
   `metadata.sessionId`, child transcript fetchable, busy→idle lifecycle.
 - `test/question-bridge.ts` — AskUserQuestion → `question.asked` → reply → answer reaches the model.
+- `test/workflow-render.ts` — Workflow run → task part linked to a child session with a live
+  progress log, busy→idle on completion.
 - `test/sdk-subagent-probe.ts` — documents how the SDK forwards subagent content (complete
   messages with `parent_tool_use_id`; never partial stream events).
 - `test/pty_attach.py` / `test/pty_permission.py` — the **stock opencode TUI** driven in a PTY:
@@ -85,6 +91,9 @@ text and tool calls, approve/deny permission prompts.
 
 - **Subagent transcripts arrive per-block**: child sessions update as each subagent message
   completes (no token-level streaming — the Agent SDK doesn't forward subagent partials).
+- **Workflow inner agents render as a progress log, not transcripts**: their conversations
+  never cross the SDK stream at all (only phase-level `task_progress` does). Full per-agent
+  transcripts exist only on disk (`transcriptDir`) — deliberately not tailed.
 - **Compaction**: emits the boundary only; no summary text.
 - **Single project per instance**: `/global/event` is unfiltered; run one shim per directory.
 - **Pinned to opencode v1.17.19** — the API is mid v1→v2 migration; other versions may drift.

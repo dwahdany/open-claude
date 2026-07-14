@@ -95,6 +95,10 @@ interface ChildCtx {
   agent: string
   user: UserMessage | null
   assistant: AssistantMessage | null
+  // Workflow runs never stream per-agent content over the SDK boundary; their child
+  // transcript is a progress log built from task_progress/task_notification instead.
+  isWorkflow?: boolean
+  lastProgress?: string
 }
 
 export class SessionEngine {
@@ -148,6 +152,7 @@ export class SessionEngine {
       permissionMode,
       includePartialMessages: true,
       forwardSubagentText: true,
+      agentProgressSummaries: true, // AI status lines on task_progress (workflows + bg subagents)
       abortController: this.abort,
       systemPrompt: { type: "preset", preset: "claude_code" },
       canUseTool: (toolName, input, opts) => this.onCanUseTool(toolName, input, opts.toolUseID),
@@ -411,8 +416,9 @@ export class SessionEngine {
       case "system": {
         const m = msg as SDKMessage & { subtype?: string } & Record<string, unknown>
         if (m.subtype === "task_started") this.onTaskStarted(m)
+        else if (m.subtype === "task_progress") this.onTaskProgress(m)
         else if (m.subtype === "task_updated") this.onTaskLifecycle(String(m.task_id ?? ""), (m.patch as { status?: string } | undefined)?.status)
-        else if (m.subtype === "task_notification") this.onTaskLifecycle(String(m.task_id ?? ""), m.status as string | undefined)
+        else if (m.subtype === "task_notification") this.onTaskLifecycle(String(m.task_id ?? ""), m.status as string | undefined, typeof m.summary === "string" ? m.summary : undefined)
         break
       }
       case "result":
@@ -513,6 +519,9 @@ export class SessionEngine {
     if (!t) return
     t.input = input
     if (mapToolName(t.name) === "task" && input.run_in_background === true) t.extraMeta = { ...t.extraMeta, background: true }
+    // Workflows always run detached (the tool result returns async_launched immediately),
+    // so the Task renderer must derive liveness from the child session, not the ✓.
+    if (t.name === "Workflow") t.extraMeta = { ...t.extraMeta, background: true }
     const mapped = mapToolInput(t.name, input)
     t.part.state = {
       status: "running",
@@ -672,12 +681,44 @@ export class SessionEngine {
       agent: typeof m.subagent_type === "string" ? m.subagent_type : typeof m.workflow_name === "string" ? `workflow:${m.workflow_name}` : undefined,
     })
     if (typeof m.task_id === "string") this.childrenByTask.set(m.task_id, c)
+    if (m.task_type === "local_workflow") {
+      c.isWorkflow = true
+      if (!c.user) {
+        const text = typeof m.prompt === "string" && m.prompt ? m.prompt : typeof m.description === "string" ? m.description : ""
+        if (text) {
+          c.user = this.store.newUserMessage(c.sessionID, c.agent, this.lastModel)
+          this.store.addMessage(c.sessionID, c.user)
+          this.store.putPart(c.sessionID, this.store.newPart(c.sessionID, c.user.id, { type: "text", text }))
+        }
+      }
+    }
   }
 
-  private onTaskLifecycle(taskId: string, status?: string): void {
+  /** Workflow progress ticks: append each distinct phase/summary line to the child log. */
+  private onTaskProgress(m: Record<string, unknown>): void {
+    const c = this.childrenByTask.get(String(m.task_id ?? ""))
+    if (!c?.isWorkflow) return
+    const line = typeof m.summary === "string" && m.summary ? m.summary : typeof m.description === "string" ? m.description : ""
+    if (!line || line === c.lastProgress) return
+    c.lastProgress = line
+    this.appendChildText(c, line)
+    this.store.touchSession(c.sessionID, {})
+  }
+
+  private appendChildText(c: ChildCtx, text: string): void {
+    const A = this.childAssistant(c)
+    const now = Date.now()
+    this.store.putPart(c.sessionID, this.store.newPart(c.sessionID, A.id, { type: "text", text, time: { start: now, end: now } }))
+  }
+
+  private onTaskLifecycle(taskId: string, status?: string, summary?: string): void {
     const c = this.childrenByTask.get(taskId)
     if (!c) return
     if (status === "completed" || status === "failed" || status === "stopped" || status === "killed") {
+      if (c.isWorkflow && summary && summary !== c.lastProgress) {
+        c.lastProgress = summary
+        this.appendChildText(c, summary)
+      }
       if (c.assistant) {
         c.assistant.time.completed = Date.now()
         this.store.updateMessage(c.sessionID, c.assistant)
