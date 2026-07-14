@@ -5,14 +5,12 @@
     "": {
       "name": "open-claude",
       "dependencies": {
-        "@anthropic-ai/claude-agent-sdk": "^0.3.207",
+        "@anthropic-ai/claude-agent-sdk": "0.3.207",
         "hono": "^4.12.30",
       },
       "devDependencies": {
         "@opencode-ai/sdk": "1.17.19",
         "@types/bun": "latest",
-      },
-      "peerDependencies": {
         "typescript": "^7.0.2",
       },
     },
