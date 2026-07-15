@@ -49,7 +49,9 @@ export function toOpencodeCommands(list: SlashCommand[]): OpencodeCommand[] {
     .filter((c) => !SHADOWED_TUI_SLASHES.has(c.name))
     .map((c) => ({
       name: c.name,
-      description: c.description ?? "",
+      // "compact" shows next to the TUI's own "Compact session" palette entry; both routes
+      // end in the same engine.compact() → CLI /compact, so label the duplicate honestly.
+      description: c.name === "compact" ? "Compact the session (same as Compact session)" : (c.description ?? ""),
       source: "command" as const,
       template: "",
       hints: c.argumentHint ? [c.argumentHint] : [],
