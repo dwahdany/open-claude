@@ -6,6 +6,7 @@ import { Hono } from "hono"
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
 import { AGENTS, CONFIG, CONFIG_PROVIDERS, DEFAULT_MODEL, PROVIDER_LIST } from "./catalog"
+import { CommandCache } from "./commands"
 import { SessionEngine } from "./engine"
 import { Id } from "./ids"
 import { Store } from "./store"
@@ -18,11 +19,15 @@ function notFound(method: string, path: string) {
 export function createApp(store: Store) {
   const app = new Hono()
   const engines = new Map<string, SessionEngine>()
+  // Slash-command cache (09 §4(b)): boot-warmed from a throwaway query; live engines
+  // refresh it on commands_changed pushes.
+  const commands = new CommandCache(store.directory)
+  commands.warm()
 
   const engineFor = (sessionID: string, agent: string): SessionEngine => {
     let e = engines.get(sessionID)
     if (!e) {
-      e = new SessionEngine(store, sessionID, store.directory, agent)
+      e = new SessionEngine(store, sessionID, store.directory, agent, (list) => commands.replace(list))
       engines.set(sessionID, e)
     }
     return e
@@ -82,7 +87,8 @@ export function createApp(store: Store) {
   })
 
   // ---- non-blocking bootstrap batch (SOFT: must resolve 200 JSON) ----
-  app.get("/command", (c) => c.json([]))
+  // Real command list (09 §1): awaits the boot warm (cap ~15s inside list()), [] fallback.
+  app.get("/command", async (c) => c.json(await commands.list()))
   app.get("/lsp", (c) => c.json([]))
   app.get("/formatter", (c) => c.json([]))
   app.get("/mcp", (c) => c.json({}))
@@ -438,6 +444,41 @@ export function createApp(store: Store) {
     return c.body(null, 204)
   })
 
+  // Custom-command execution (09 §2): validate the NAME against the cache, then run a
+  // blocking turn whose text is the reconstructed slash invocation — the Claude CLI does its
+  // own $ARGUMENTS/positional templating (do NOT re-implement 09 §2.2). "compact" routes to
+  // the real compaction (same outcome as the palette's POST /summarize — 09 §5.7).
+  app.post("/session/:id/command", async (c) => {
+    const id = c.req.param("id")
+    const session = store.getSession(id)
+    if (!session) return c.json({ name: "NotFoundError", data: { message: "session not found" } }, 404)
+    const body = await safeBody(c)
+    const name = typeof body.command === "string" ? body.command : ""
+    const list = await commands.list()
+    if (!list.some((cmd) => cmd.name === name)) {
+      // Reference behavior (09 §2.2 step 1): session.error SSE (the TUI toasts it) + 400
+      // {"_tag":"BadRequest"} — never 404 for unknown NAMES.
+      store.error(id, { name: "UnknownError", data: { message: `Command not found: "${name}". Available commands: ${list.map((x) => x.name).join(", ")}` } })
+      return c.json({ _tag: "BadRequest" }, 400)
+    }
+    const agent = body.agent ?? session.agent ?? "build"
+    // body.model is a "providerID/modelID" STRING split on the FIRST slash (09 §2.1);
+    // fall back to the session model.
+    const base = resolveModel({}, session)
+    const slash = typeof body.model === "string" ? body.model.indexOf("/") : -1
+    const model =
+      slash > 0
+        ? { providerID: body.model.slice(0, slash), modelID: body.model.slice(slash + 1), variant: body.variant }
+        : { ...base, variant: body.variant ?? base.variant }
+    const args = typeof body.arguments === "string" ? body.arguments : ""
+    const engine = engineFor(id, agent)
+    if (name === "compact") await engine.compact(args.trim() || undefined, model, agent)
+    else await engine.prompt("/" + name + (args ? " " + args : ""), model, agent)
+    // Respond like the message route: final assistant message + parts (TUI ignores it).
+    const wp = [...store.messages(id)].reverse().find((m) => m.info.role === "assistant")
+    return c.json(wp ?? { info: null, parts: [] })
+  })
+
   app.post("/session/:id/abort", async (c) => {
     const e = engines.get(c.req.param("id"))
     if (e) await e.interrupt()
@@ -476,7 +517,28 @@ export function createApp(store: Store) {
     return c.json(forked)
   })
 
-  app.post("/session/:id/summarize", (c) => c.json(true))
+  // Real compaction (09 §5): body {providerID, modelID, auto?} — the TUI's /compact palette
+  // entry sends its selected model, fire-and-forget. BLOCKING like the reference (the
+  // handler awaits the whole compact turn), then bare true.
+  app.post("/session/:id/summarize", async (c) => {
+    const id = c.req.param("id")
+    const session = store.getSession(id)
+    if (!session) return c.json({ name: "NotFoundError", data: { message: "session not found" } }, 404)
+    const body = await safeBody(c)
+    // Nothing to compact (no live engine AND no resumable CLI transcript): the reference
+    // still answers true (it runs a degenerate summarize call on empty sessions — 09 §5.2);
+    // we skip the pointless LLM round-trip and just return the same body.
+    if (!engines.has(id) && !store.resumeInfo(id).claudeSessionId) return c.json(true)
+    // Reference agent selection: the LAST user message's agent, else the default.
+    const lastUser = [...store.messages(id)].reverse().find((m) => m.info.role === "user")
+    const agent = (lastUser?.info as { agent?: string } | undefined)?.agent ?? session.agent ?? "build"
+    const model =
+      typeof body.modelID === "string" && body.modelID
+        ? { providerID: typeof body.providerID === "string" && body.providerID ? body.providerID : "anthropic", modelID: body.modelID }
+        : resolveModel({}, session)
+    await engineFor(id, agent).compact(undefined, model, agent)
+    return c.json(true)
+  })
   app.post("/session/:id/share", (c) => c.json({ ...store.getSession(c.req.param("id")), share: { url: "" } }, 500))
   app.delete("/session/:id/share", (c) => c.json(store.getSession(c.req.param("id"))))
 

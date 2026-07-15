@@ -156,7 +156,7 @@ For each: method+path, exact response type (verbatim from `SDK/src/v2/gen/types.
 
 | # | Route | Caller | Stub | Degradation when empty |
 |---|-------|--------|------|------------------------|
-| 1 | `GET /command` | sync.tsx:517 | `[]` | No user/MCP/skill slash-commands in palette; built-ins unaffected |
+| 1 | `GET /command` | sync.tsx:517 | **no longer a stub** — boot-warmed SDK slash-command cache mapped to the opencode `Command` shape, TUI-palette collisions filtered except `compact` (09 §1/§4(b)/§5.7, src/commands.ts); `[]` only while the warm is pending/failed | Autocomplete lists project commands + CLI built-ins; `POST /session/:id/command` executes them |
 | 2 | `GET /lsp` | sync.tsx:518 (+ on `lsp.updated` event, sync.tsx:429) | `[]` | LSP section of status UI empty. Harmless |
 | 3 | `GET /mcp` | sync.tsx:519 (+ `TUI/src/component/dialog-mcp.tsx:59` on dialog open) | `{}` | MCP list dialog empty. Harmless |
 | 4 | `GET /experimental/resource` | sync.tsx:520-522 | `{}` | No MCP resources for mentions. Harmless |
@@ -320,7 +320,7 @@ These are outside the "read" stubs but a bare `true` (their declared success typ
 - `POST /mcp/{name}/connect`, `POST /mcp/{name}/disconnect` → `200: true` (types.gen.ts:8657-8664) — MCP toggle (`TUI/src/context/local.tsx:510-519`).
 - `GET /experimental/workspace/sync-list` → `200: boolean`; `.catch`-protected at call sites (`dialog-workspace-create.tsx:81`, `dialog-workspace-list.tsx:91`).
 - Everything under `/experimental/workspace` (create/remove/warp), `/api/session/.../projectCopy`, provider OAuth (`/provider/{id}/oauth/*`), `PUT /auth/{providerID}`, `POST /global/upgrade` (app.tsx:1058): user-initiated, error-toast handled. A JSON 404 (§5.5) is acceptable; do not stub `true` for flows you can't actually perform (e.g., workspace create), or the UI will proceed on a lie.
-- **No longer stubs**: `/experimental/project/{pid}/copy` (+ `/refresh`, `/generate-name`, DELETE) and `/experimental/control-plane/move-session` are fully implemented per 08-move-session.md (git-worktree copies, real session moves; verified by test/live-move.ts).
+- **No longer stubs**: `/experimental/project/{pid}/copy` (+ `/refresh`, `/generate-name`, DELETE) and `/experimental/control-plane/move-session` are fully implemented per 08-move-session.md (git-worktree copies, real session moves; verified by test/live-move.ts). `POST /session/{id}/summarize` no longer returns a bare `true` stub — it performs a REAL compaction (blocking, then `true`; reference shape extracted in 09 §5, verified by test/live-commands.ts).
 
 ### 3.5 Routes that exist in the API but the TUI v1.17.19 never calls
 

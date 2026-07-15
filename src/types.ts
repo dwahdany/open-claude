@@ -51,6 +51,7 @@ export interface AssistantMessage {
   mode: string
   agent: string
   path: { cwd: string; root: string }
+  summary?: boolean // compaction summary message (05 §2.2 / 09 §5): mode/agent "compaction"
   cost: number
   tokens: Tokens
   variant?: string

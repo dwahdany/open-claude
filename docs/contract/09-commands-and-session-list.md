@@ -356,10 +356,12 @@ GET /session?directory=%2FUsers%2Fme%2Fproj&roots=true&limit=100&path= HTTP/1.1
 
 ## 4. open-claude implementation notes
 
-Current state: `GET /command` is still a `[]` stub. Section (a) below is IMPLEMENTED
-(verified by test/live-resume.ts): `GET /session` honors roots/search/start/limit/scope/path
-with sort-then-limit, `DELETE /session/:id` cascades children-first (each `session.deleted`
-carrying `info`), and `GET /session/status` returns the busy-only map.
+Current state: sections (a) AND (b) are IMPLEMENTED (verified by test/live-resume.ts and
+test/live-commands.ts): `GET /session` honors roots/search/start/limit/scope/path with
+sort-then-limit, `DELETE /session/:id` cascades children-first (each `session.deleted`
+carrying `info`), `GET /session/status` returns the busy-only map, `GET /command` serves the
+boot-warmed SDK command cache (src/commands.ts), `POST /session/:id/command` executes
+commands CLI-side, and `POST /session/:id/summarize` performs a real compaction (§5).
 
 ### (a) /sessions dialog parity within one run
 
@@ -440,3 +442,125 @@ Execution mapping for `POST /session/:id/command`:
   paths must therefore work; consider filtering SDK built-ins that shadow opencode palette slashes
   (`compact`, `init`, `exit`, ...) out of `GET /command` to keep a single code path, or exploit it
   deliberately as the /compact implementation.
+
+---
+
+## 5. POST /session/:id/summarize — the reference compaction contract (extracted)
+
+Target for open-claude's real /compact. Authoritative sources (repo-relative to
+`vendor/opencode/`):
+
+| What | File |
+|---|---|
+| Route decl + `SummarizePayload` | `packages/opencode/src/server/routes/instance/httpapi/groups/session.ts:65-69,303-316` |
+| Handler | `.../handlers/session.ts:273-293` |
+| Compaction service (message shapes) | `packages/opencode/src/session/compaction.ts:289-536` |
+| Loop dispatch (busy status, auto-overflow) | `packages/opencode/src/session/prompt.ts:1081-1167` |
+| `session.compacted` event schema | `packages/schema/src/session-compaction-event.ts` |
+| v1 wire schemas (`CompactionPart`, `Assistant.summary`) | `packages/schema/src/v1/session.ts:195-201,470` |
+| TUI trigger | `packages/tui/src/routes/session/index.tsx:554-579` |
+| TUI rendering | `routes/session/index.tsx:1378,1442-1451`; `component/prompt/index.tsx:262-281` |
+
+### 5.1 Request / response
+
+- `POST /session/{sessionID}/summarize`, JSON body `{providerID, modelID, auto?: boolean}`
+  (`SummarizePayload`). The TUI's **/compact palette entry (aliases: `["summarize"]`)**
+  fire-and-forgets it with the currently-selected model; the response is ignored — all
+  rendering rides SSE. No provider selected → local toast, no request.
+- Response: `200` bare `true`, returned only **after the whole compaction turn completes**
+  (the handler awaits `promptSvc.loop`). Unknown session → 404
+  `{"name":"NotFoundError","data":{...}}`; other pipeline failures → 400 (BadRequest).
+- **Empty session is NOT an error**: the reference still creates the message pair below,
+  runs a degenerate summarize call, and returns `true`.
+
+### 5.2 Handler pipeline (handlers/session.ts:273-293)
+
+`revert cleanup → agent := findLast(user message).agent ?? defaultAgent →
+compaction.create({sessionID, agent, model: payload, auto: payload.auto ?? false}) →
+prompt loop → true`.
+
+### 5.3 Wire-observable sequence (v1 SSE)
+
+a. `message.updated` — NEW **user** message `{agent, model: <payload model>, time.created}`
+   with **no text part ever**.
+b. `message.part.updated` — a **compaction part** on it:
+   `{type:"compaction", auto: <payload.auto ?? false>}` (+ optional `overflow`,
+   `tail_start_id` backfilled later; schema v1/session.ts:195-201).
+c. `session.status {type:"busy"}` (loop entry).
+d. `message.updated` — NEW **assistant** message
+   `{parentID: <compaction user msg id>, mode:"compaction", agent:"compaction",
+   summary:true, cost:0, tokens zeroed}` (compaction.ts:356-381).
+e. The summary text streams into it as one normal **text part**
+   (message.part.updated/deltas) framed by step-start/step-finish parts; on completion the
+   assistant message carries the compaction call's usage in tokens/cost, `finish`,
+   `time.completed` (processor.ts:435-456).
+f. `session.compacted {sessionID}` on success — **no TUI consumer at v1.17.19**.
+g. `session.status idle` + `session.idle` at loop exit.
+
+`GET /session/:id/message` afterwards returns EVERYTHING: the full pre-compact history plus
+the compaction pair — `filterCompacted` is server-internal model-input pruning, never
+applied to the read route.
+
+### 5.4 Auto-compaction
+
+The loop creates the same pair with `auto:true` when the last finished assistant message
+overflows the model window (prompt.ts:1159-1166) — mid-conversation, unprompted — then (in
+the non-overflow path) appends a synthetic `"Continue if you have next steps..."` user
+message (`synthetic:true` text part, `metadata.compaction_continue`; compaction.ts:451-503).
+
+### 5.5 What the TUI renders
+
+- The compaction **user** message → a centered `── Compaction ──` horizontal rule
+  (`UserMessage` shows no bubble when there is no non-synthetic text part; the compaction
+  part adds the rule — routes/session/index.tsx:1378,1442-1451).
+- The summary **assistant** message renders as a NORMAL assistant message — the TUI never
+  reads `Assistant.summary` or mode `"compaction"`.
+- Context % in the prompt footer = token sum of the **last assistant message with
+  `tokens.output > 0`** (prompt/index.tsx:262-281) — after a compact that is the summary
+  message, so its tokens define the displayed context size.
+- `session.time.compacting` ("compacting" spinner state in sync.tsx:581) has no live writer
+  at this tag — dead field, safe to ignore.
+
+### 5.6 open-claude mapping (CLI 2.1.207 /compact sequence → this shape)
+
+The CLI emits, with ZERO stream_events (probe test/probe-slash-commands.ts finding 4):
+`system/status {status:"compacting"}` → `system/status {status:null, compact_result}` →
+re-emitted `system/init` → `system/compact_boundary {compact_metadata:{trigger, pre_tokens,
+post_tokens, ...}}` → `user {isSynthetic:true, content: STRING "This session is being
+continued..."}` → `user {isReplay:true, content "<local-command-stdout>Compacted
+</local-command-stdout>"}` → `result {subtype:"success", num_turns:0}`.
+
+Mapping (src/engine.ts `compact()` / `compactCtx`):
+
+- `compact()` entry (serialized through the same turnQueue as prompts): creates the
+  compaction user message + `{type:"compaction", auto:false}` part up front (§5.3 a-b),
+  sets busy, pushes `"/compact[ <instructions>]"`.
+- status frames: no reference equivalent (busy already set) — ignored; a
+  `compact_result:"failed"` surfaces `session.error` with `compact_error`.
+- re-emitted `system/init`: harmless (silent claudeSessionId capture no-ops/updates).
+- `compact_boundary`: opens the summary assistant message (mode/agent `"compaction"`,
+  `summary:true`, parentID = compaction user msg; §5.3 d). For `trigger:"auto"`
+  (unprompted mid-turn) the PAIR is created here with `auto:true`; the in-flight outer
+  turn's state is untouched.
+- `user isSynthetic` (string content): becomes the summary message's text part; the message
+  completes with `finish:"stop"` and `tokens {input:0, output: post_tokens}` — the closest
+  observable analogue of the reference's compaction-call usage, and it makes the TUI
+  context % show the post-compact size (§5.5). Session tokens touched to match;
+  `session.compacted` emitted.
+- `user isReplay "<local-command-stdout>"`: dropped — the engine never renders main-session
+  user frames, so neither this nor the synthetic blob can appear as a user message.
+- `result` (num_turns 0): finalizes the turn (busy → idle) — this is what unblocks the
+  blocking POST.
+- `POST /session/:id/summarize`: honors the body model, agent = last user message's agent
+  (§5.2), blocking, returns `true`. Sessions with nothing to compact (no live engine AND no
+  stored claudeSessionId) return `true` with no side effects — the reference would run a
+  degenerate summarize call; the shim skips the pointless LLM round-trip.
+
+### 5.7 The typed /compact path
+
+`GET /command` deliberately does NOT shadow-filter the SDK's `compact` entry
+(src/commands.ts `SHADOWED_TUI_SLASHES`), so a fully-typed `/compact [instructions]` +
+Enter reaches `POST /session/:id/command`, which routes `command === "compact"` to the same
+engine entry point (instructions appended after the slash) — the same real compaction as
+the palette's `POST /summarize`. Every other TUI palette slash name/alias IS filtered out
+of the list so the palette stays the single dispatch path for them.

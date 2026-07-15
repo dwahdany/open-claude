@@ -181,15 +181,40 @@ export function relocateTranscript(uuid: string, oldDir: string, newDir: string,
     if (srcDir === dstDir) return true
     if (mode === "seed" && existsSync(join(dstDir, `${uuid}.jsonl`))) return true // never clobber
     mkdirSync(dstDir, { recursive: true })
-    copyFileSync(join(srcDir, `${uuid}.jsonl`), join(dstDir, `${uuid}.jsonl`))
+    const dstJsonl = join(dstDir, `${uuid}.jsonl`)
     const sibling = join(srcDir, uuid)
-    if (existsSync(sibling)) {
-      rmSync(join(dstDir, uuid), { recursive: true, force: true }) // replace, never merge stale
-      cpSync(sibling, join(dstDir, uuid), { recursive: true })
-      if (mode === "move") rmSync(sibling, { recursive: true, force: true })
+    let wroteSibling = false
+    try {
+      copyFileSync(join(srcDir, `${uuid}.jsonl`), dstJsonl)
+      if (existsSync(sibling)) {
+        rmSync(join(dstDir, uuid), { recursive: true, force: true }) // replace, never merge stale
+        wroteSibling = true // set BEFORE cpSync so a partial copy is rolled back too
+        cpSync(sibling, join(dstDir, uuid), { recursive: true })
+      }
+      if (mode === "move") {
+        // Source jsonl FIRST: once it is gone the source is no longer resumable, so a failed
+        // sibling cleanup below leaves inert junk, never a second LIVE transcript.
+        rmSync(join(srcDir, `${uuid}.jsonl`), { force: true })
+        try {
+          rmSync(sibling, { recursive: true, force: true })
+        } catch (junk) {
+          console.error(`open-claude: leftover subagent dir ${sibling} could not be removed (harmless, not resumable):`, junk)
+        }
+      }
+      return true
+    } catch (err) {
+      // A partial relocation would leave the uuid transcript LIVE in BOTH munged dirs — a
+      // silent divergent fork on the next resume. Roll the destination back so at most one
+      // live copy remains (the source, which nothing above deleted before this point).
+      try {
+        rmSync(dstJsonl, { force: true })
+        if (wroteSibling) rmSync(join(dstDir, uuid), { recursive: true, force: true })
+      } catch (rollbackErr) {
+        console.error(`open-claude: ROLLBACK FAILED — transcript ${uuid}.jsonl may now be live in BOTH ${srcDir} and ${dstDir}; the next resume can fork divergently:`, rollbackErr)
+      }
+      console.error(`open-claude: transcript relocation for ${uuid} failed (destination rolled back; continuing):`, err)
+      return false
     }
-    if (mode === "move") rmSync(join(srcDir, `${uuid}.jsonl`), { force: true })
-    return true
   } catch (err) {
     console.error(`open-claude: transcript relocation for ${uuid} failed (continuing):`, err)
     return false

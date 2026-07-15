@@ -8,7 +8,7 @@
 // session (parentID set); the parent's task tool part gets state.metadata.sessionId, which is
 // what the TUI reads to show live progress and navigate into the child transcript.
 
-import { query, type EffortLevel, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk"
+import { query, type EffortLevel, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk"
 import { Id } from "./ids"
 import { newPermissionRequest, type Store } from "./store"
 import { flattenToolResult, mapToolInput, mapToolName, toolMetadata, toolTitle } from "./tools"
@@ -117,6 +117,10 @@ export class SessionEngine {
   private assistant: AssistantMessage | null = null
   private turnDone: Deferred<void> | null = null
   private resultErrored = false // this turn already surfaced session.error from an error result
+  // Active compaction — a manual /compact turn OR an unprompted auto-compact mid-turn.
+  // Maps the CLI sequence onto the reference pair (09 §5): userID = the compaction user
+  // message (carries the {type:"compaction"} part), assistant = the summary message.
+  private compactCtx: { userID: string; assistant: AssistantMessage | null; postTokens?: number } | null = null
   private partObjs = new Map<string, Part>() // partID → live Part object (same ref as in store)
   private blocks = new Map<number, BlockCtx>() // content_block index → ctx (reset per step)
   private textAccum = new Map<string, string>()
@@ -139,6 +143,7 @@ export class SessionEngine {
     private sessionID: string,
     private directory: string,
     private agent: string,
+    private onCommandsChanged?: (commands: SlashCommand[]) => void, // commands_changed → server cache
   ) {}
 
   private startQuery(model: string, permissionMode: Options["permissionMode"], effort?: EffortLevel): void {
@@ -216,6 +221,51 @@ export class SessionEngine {
     const run = this.turnQueue.then(() => this.runTurn(text, model, agent))
     this.turnQueue = run.catch(() => {})
     return run
+  }
+
+  /** Real compaction (09 §5): pushes "/compact" and maps the CLI's frame sequence onto the
+   *  reference wire shape. Serialized through the SAME queue as prompts so it can never
+   *  interleave a streaming turn. Resolves when the compact turn's result arrives. */
+  compact(instructions: string | undefined, model: { providerID: string; modelID: string; variant?: string }, agent: string): Promise<void> {
+    const run = this.turnQueue.then(() => this.runCompactTurn(instructions, model, agent))
+    this.turnQueue = run.catch(() => {})
+    return run
+  }
+
+  private async runCompactTurn(instructions: string | undefined, model: { providerID: string; modelID: string; variant?: string }, agent: string): Promise<void> {
+    if (this.disposed) return
+    this.lastModel = { providerID: model.providerID, modelID: model.modelID }
+    const permissionMode: Options["permissionMode"] = agent === "plan" ? "plan" : agent === "auto" ? "auto" : "default"
+    const effort = variantEffort(model.variant)
+    this.startQuery(model.modelID, permissionMode, effort)
+    await this.applyEffort(effort)
+    await this.applyMode(model.modelID, permissionMode)
+
+    // Reference shape (09 §5.3 a-b): a user message carrying ONLY a compaction part — the
+    // TUI renders it as the "── Compaction ──" rule, never as a text bubble.
+    const user = this.store.newUserMessage(this.sessionID, agent, model)
+    this.store.addMessage(this.sessionID, user)
+    this.store.putPart(this.sessionID, this.store.newPart(this.sessionID, user.id, { type: "compaction", auto: false }))
+    this.store.setBusy(this.sessionID, true)
+
+    // No streaming assistant: /compact emits ZERO stream_events (probe finding 4). The
+    // summary message opens at compact_boundary instead.
+    this.assistant = null
+    this.compactCtx = { userID: user.id, assistant: null }
+    this.partObjs.clear()
+    this.blocks.clear()
+    this.textAccum.clear()
+    this.stepTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+    this.resultErrored = false
+    this.turnDone = defer<void>()
+
+    this.input.push({
+      type: "user",
+      message: { role: "user", content: [{ type: "text", text: "/compact" + (instructions ? " " + instructions : "") }] },
+      parent_tool_use_id: null,
+    })
+
+    await this.turnDone.promise
   }
 
   private async runTurn(text: string, model: { providerID: string; modelID: string; variant?: string }, agent: string): Promise<void> {
@@ -424,6 +474,10 @@ export class SessionEngine {
   }
 
   private handle(msg: SDKMessage): void {
+    // resultErrored dedupes ONLY the immediate result→iterator-throw pair: any message that
+    // arrives after the flagging result proves the stream survived it, so a LATER genuine
+    // stream death must surface its own session.error (carried-over /move review fix).
+    if (this.resultErrored) this.resultErrored = false
     switch (msg.type) {
       case "stream_event": {
         const m = msg as SDKMessage & { parent_tool_use_id: string | null; event: unknown }
@@ -433,34 +487,122 @@ export class SessionEngine {
         break
       }
       case "assistant": {
-        const m = msg as SDKMessage & { parent_tool_use_id: string | null; message?: { content?: unknown } }
-        // Main-session assistant content is rendered from stream events; forwarded subagent
-        // messages (parent_tool_use_id set) are mirrored into the child session.
+        const m = msg as SDKMessage & { parent_tool_use_id: string | null; message?: { content?: unknown; model?: string } }
+        // Main-session assistant content is rendered from stream events — EXCEPT synthetic
+        // messages (message.model === "<synthetic>"): those arrive COMPLETE with zero
+        // stream_events (unknown-command output and similar local command stdout) and would
+        // otherwise be invisible. Forwarded subagent messages (parent_tool_use_id set) are
+        // mirrored into the child session.
         if (m.parent_tool_use_id) this.onChildAssistant(m.parent_tool_use_id, m.message?.content)
+        else if (m.message?.model === "<synthetic>") this.onSyntheticAssistant(m.message?.content)
         break
       }
       case "user": {
-        const m = msg as SDKUserMessage
-        if (m.parent_tool_use_id) this.onChildUser(m.parent_tool_use_id, (m.message as { content?: unknown })?.content)
+        const m = msg as SDKUserMessage & { isSynthetic?: boolean; isReplay?: boolean }
+        const content = (m.message as { content?: unknown })?.content
+        // /compact frames (probe finding 4): the isSynthetic STRING user message is the
+        // summary — rendered as the reference's summary assistant message, never as a user
+        // message. The isReplay "<local-command-stdout>" frame needs no handling: main-session
+        // user frames are never rendered.
+        if (!m.parent_tool_use_id && this.compactCtx && m.isSynthetic === true && m.isReplay !== true && typeof content === "string") {
+          this.onCompactSummary(content)
+          break
+        }
+        if (m.parent_tool_use_id) this.onChildUser(m.parent_tool_use_id, content)
         this.onToolResults(m) // tool_results resolve via the shared tools map, main or child
         break
       }
       case "system": {
         const m = msg as SDKMessage & { subtype?: string } & Record<string, unknown>
-        // init re-fires at the start of EVERY user turn on CLI 2.1.207; the capture is a
-        // SILENT store mutation that no-ops when unchanged. After a fork, the first init's
-        // NEW uuid replaces the inherited one and clears forkPending.
+        // init re-fires at the start of EVERY user turn on CLI 2.1.207 (and again mid-
+        // /compact); the capture is a SILENT store mutation that no-ops when unchanged.
+        // After a fork, the first init's NEW uuid replaces the inherited one and clears
+        // forkPending.
         if (m.subtype === "init") {
           if (typeof m.session_id === "string" && m.session_id) this.store.setClaudeSessionId(this.sessionID, m.session_id)
         } else if (m.subtype === "task_started") this.onTaskStarted(m)
         else if (m.subtype === "task_progress") this.onTaskProgress(m)
         else if (m.subtype === "task_updated") this.onTaskLifecycle(String(m.task_id ?? ""), (m.patch as { status?: string } | undefined)?.status)
         else if (m.subtype === "task_notification") this.onTaskLifecycle(String(m.task_id ?? ""), m.status as string | undefined, typeof m.summary === "string" ? m.summary : undefined)
+        else if (m.subtype === "compact_boundary") this.onCompactBoundary(m)
+        else if (m.subtype === "status") this.onCompactStatus(m)
+        else if (m.subtype === "commands_changed") this.onCommandsChanged?.((m.commands as SlashCommand[] | undefined) ?? [])
         break
       }
       case "result":
         this.onResult(msg as never)
         break
+    }
+  }
+
+  /** Synthetic main-session assistant messages (message.model === "<synthetic>") carry
+   *  complete text blocks and no stream events — render them into the current turn's
+   *  assistant message so "Unknown command: /x"-style output is visible and persisted. */
+  private onSyntheticAssistant(content: unknown): void {
+    const A = this.assistant
+    if (!A || !Array.isArray(content)) return
+    const now = Date.now()
+    for (const block of content as { type?: string; text?: unknown }[]) {
+      if (block?.type !== "text" || !block.text) continue
+      this.putPart(this.store.newPart(this.sessionID, A.id, { type: "text", text: String(block.text), time: { start: now, end: now } }))
+    }
+  }
+
+  // ---- compaction mapping (09 §5: CLI /compact sequence → reference wire shape) ----
+
+  /** Opens the summary assistant message once (reference 09 §5.3 d): parentID = the
+   *  compaction user message, mode/agent "compaction", summary: true. */
+  private compactAssistant(): AssistantMessage {
+    const c = this.compactCtx!
+    if (c.assistant) return c.assistant
+    const A = this.store.newAssistantMessage(this.sessionID, c.userID, "compaction", this.lastModel.providerID, this.lastModel.modelID)
+    A.summary = true
+    c.assistant = A
+    this.store.addMessage(this.sessionID, A)
+    this.putPart(this.store.newPart(this.sessionID, A.id, { type: "step-start" }))
+    return A
+  }
+
+  private onCompactBoundary(m: Record<string, unknown>): void {
+    const meta = (m.compact_metadata ?? {}) as Record<string, unknown>
+    if (!this.compactCtx) {
+      // UNPROMPTED auto-compaction mid-turn (trigger:"auto"): create the reference pair now.
+      // The in-flight turn's state (assistant/blocks/tools) is deliberately untouched — the
+      // re-emitted system/init and the turn's later frames keep flowing into the outer turn.
+      const user = this.store.newUserMessage(this.sessionID, this.agent, this.lastModel)
+      this.store.addMessage(this.sessionID, user)
+      this.store.putPart(this.sessionID, this.store.newPart(this.sessionID, user.id, { type: "compaction", auto: meta.trigger !== "manual" }))
+      this.compactCtx = { userID: user.id, assistant: null }
+    }
+    this.compactCtx.postTokens = typeof meta.post_tokens === "number" ? meta.post_tokens : undefined
+    this.compactAssistant()
+  }
+
+  /** The isSynthetic summary user frame: its string content becomes the summary message's
+   *  text; tokens = post_tokens (the TUI's context %% reads the LAST assistant message with
+   *  output > 0, so this makes it show the post-compact size — 09 §5.5). */
+  private onCompactSummary(text: string): void {
+    const c = this.compactCtx
+    if (!c) return
+    const A = this.compactAssistant()
+    const now = Date.now()
+    this.putPart(this.store.newPart(this.sessionID, A.id, { type: "text", text, time: { start: now, end: now } }))
+    A.time.completed = now
+    A.finish = "stop"
+    if (c.postTokens !== undefined) A.tokens = { input: 0, output: c.postTokens, reasoning: 0, cache: { read: 0, write: 0 } }
+    this.putPart(this.store.newPart(this.sessionID, A.id, { type: "step-finish", reason: "stop", cost: A.cost, tokens: { ...A.tokens } }))
+    this.store.updateMessage(this.sessionID, A)
+    this.store.touchSession(this.sessionID, { tokens: A.tokens })
+    // Reference success event (schema/src/session-compaction-event.ts); no TUI consumer.
+    this.store.bus.publish("session.compacted", { sessionID: this.sessionID }, this.store.getSession(this.sessionID)?.directory)
+    this.compactCtx = null
+  }
+
+  /** /compact progress frames have no reference equivalent (busy is already set); only a
+   *  failed compact_result surfaces as session.error. */
+  private onCompactStatus(m: Record<string, unknown>): void {
+    if (m.compact_result != null && m.compact_result !== "success") {
+      this.store.error(this.sessionID, { name: "UnknownError", data: { message: `Compaction failed: ${String(m.compact_error ?? m.compact_result)}` } })
     }
   }
 
@@ -824,6 +966,7 @@ export class SessionEngine {
   }
 
   private finishTurn(): void {
+    this.compactCtx = null // a failed/aborted compact must not capture a later synthetic frame
     this.store.setBusy(this.sessionID, false)
     const d = this.turnDone
     this.turnDone = null
