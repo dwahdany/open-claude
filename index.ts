@@ -4,7 +4,6 @@
 // --serve (or a non-TTY, or no opencode CLI) runs the server standalone and prints the URL.
 
 import { createApp } from "./src/server"
-import { Id } from "./src/ids"
 import { Store } from "./src/store"
 
 const OPENCODE_PIN = "1.17.19"
@@ -44,9 +43,9 @@ Env:
 const port = Number(arg("port", "0")) // 0 = let the OS pick a free port (matches `opencode serve`)
 const hostname = arg("hostname", "127.0.0.1")
 const directory = arg("directory", process.cwd())
-const projectID = Id.project()
 
-const store = new Store(directory, projectID)
+// Loads project.json (stable projectID) + every persisted session BEFORE serving.
+const store = await Store.load(directory)
 const app = createApp(store)
 
 let server: ReturnType<typeof Bun.serve>

@@ -25,10 +25,11 @@ export class Bus {
     return `data: ${JSON.stringify(obj)}\n\n`
   }
 
-  /** Emit an event to all connected clients, wrapped in the GlobalEvent envelope. */
-  publish(type: string, properties: Record<string, unknown>): void {
+  /** Emit an event to all connected clients, wrapped in the GlobalEvent envelope.
+   *  Session-scoped events pass the OWNING session's directory; default is the primary. */
+  publish(type: string, properties: Record<string, unknown>, directory?: string): void {
     const frame = this.encode({
-      directory: this.directory,
+      directory: directory ?? this.directory,
       payload: { id: Id.event(), type, properties },
     })
     for (const sub of this.subscribers) sub(frame)

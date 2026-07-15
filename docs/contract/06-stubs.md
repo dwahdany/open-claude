@@ -166,7 +166,7 @@ For each: method+path, exact response type (verbatim from `SDK/src/v2/gen/types.
 | 8 | `GET /vcs` | sync.tsx:528 (+ SSE `vcs.branch.updated` keeps it fresh, sync.tsx:433-438) | `{"branch":"main"}` or `{}` | No git branch in status bar |
 | 9 | `GET /experimental/workspace` | project.tsx:56 (self-caught) | `[]` | Workspace switcher empty |
 | 10 | `GET /experimental/workspace/status` | project.tsx:58 (self-caught) | `[]` | No workspace status badges |
-| 11 | `GET /session` (no `--continue`) | sync.tsx:164-168,515; query `start=<now-30d>&scope=project` or `path=...` | `[]` | Empty session list (fine for a fresh shim); with `--continue` this is **blocking** |
+| 11 | `GET /session` (no `--continue`) | sync.tsx:164-168,515; query `start=<now-30d>&scope=project` or `path=...` | **no longer a stub** — persistent list with roots/search/start/limit/scope/path filters (09 §3.1, 07 §13) | n/a; with `--continue` this is **blocking** |
 | 12 | `GET /experimental/capabilities` | sync.tsx:454 (self-caught) | `{"backgroundSubagents":false}` | `experimentalBackgroundSubagents` false → no background-subagent UI |
 | 13 | `GET /experimental/console` | sync.tsx:458, 516 (self-caught) | `{"consoleManagedProviders":[],"switchableOrgCount":0}` | Console/org-switch UI hidden |
 

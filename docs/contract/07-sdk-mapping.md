@@ -1100,3 +1100,42 @@ Error:
     `type`/`subtype` and default to ignore.
 20. **Bun compiled binaries** need `pathToClaudeCodeExecutable` + `extractFromBunfs` (README) —
     affects packaging, not dev.
+
+---
+
+## 13. Shim persistence & resume (implemented; verified by test/live-resume.ts)
+
+State root: `(XDG_DATA_HOME | ~/.local/share)/open-claude/project/<munge(realpath(primaryDirectory))>/`
+where `munge` replaces every `[^A-Za-z0-9]` with `-` (same rule as `~/.claude/projects`). Layout:
+
+- `project.json` — `{ id, directory }`; the `prj_` id is minted once and reused forever
+  (`GET /project/current` must be stable and match `Session.projectID` across restarts).
+- `session/<sessionID>.json` — `{ session, messages: WithParts[] (ascending id order — the
+  order array is implicit), todos, claudeSessionId?, forkPending? }`. `busy` is transient and
+  never persisted; everything hydrates idle.
+
+Mechanics (src/store.ts): per-session dirty set; ~300 ms trailing-throttle flush via `Bun.write`
+to `<file>.tmp` + atomic rename; synchronous `writeFileSync` flush on SIGINT/SIGTERM/exit (the
+only place sync fs is allowed). `Store.load()` hydrates straight into the private maps — never
+through the emitting mutations — so a connected TUI gets no SSE history replay.
+
+Resume / self-heal rules (src/engine.ts; probe ground truth in test/probe-resume.ts and
+test/probe-cross-cwd-resume.ts headers):
+
+- `system/init.session_id` is captured via the SILENT store mutation `setClaudeSessionId`
+  (init re-fires at the start of EVERY turn on CLI 2.1.207 — only persisted when changed).
+- `startQuery` reads cwd from the owning session's `directory` and arms `options.resume` from
+  the stored `claudeSessionId` (free: a resumed query emits nothing until the first input).
+- Dead stream (consume()'s finally, engine not disposed): reject pending permission/question
+  dialogs, error in-flight main-session tool parts, reset `started/q/abort/input` — the next
+  prompt lazily relaunches with resume and the conversation continues.
+- Resume-not-found (`"No conversation found with session ID"` in an `error_during_execution`
+  result) clears `claudeSessionId` silently so the next restart starts fresh; the turn still
+  surfaces `session.error`, and the iterator's trailing throw is absorbed by consume().
+
+Fork mapping (`POST /session/:id/fork` → src/store.ts forkSession): new opencode session copying
+directory/path/agent/model/title; messages/parts/todos deep-copied with FRESH sequentially-minted
+ids (sessionID/messageID/parentID remapped, ascending order preserved); `claudeSessionId` is
+inherited with `forkPending: true`, so the fork's first engine start passes
+`forkSession: true` + `resume`, and its first init's NEW uuid replaces the inherited one —
+the original session stays unpolluted (probe-resume finding 4).

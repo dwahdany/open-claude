@@ -31,19 +31,27 @@ export function createApp(store: Store) {
   app.get("/agent", (c) => c.json(AGENTS))
   app.get("/config", (c) => c.json(CONFIG))
 
-  app.get("/path", (c) =>
-    c.json({
+  app.get("/path", (c) => {
+    // A ?directory= query (per-session dirs) echoes back as both directory and worktree.
+    const dir = c.req.query("directory") || store.directory
+    return c.json({
       home: process.env.HOME ?? "",
       state: `${process.env.HOME ?? ""}/.local/state/opencode`,
       config: `${process.env.HOME ?? ""}/.config/opencode`,
-      worktree: store.directory,
-      directory: store.directory,
-    }),
-  )
+      worktree: dir,
+      directory: dir,
+    })
+  })
+  // store.projectID is persisted (project.json) — stable across restarts, matches Session.projectID.
   app.get("/project/current", (c) =>
     c.json({ id: store.projectID, worktree: store.directory, vcs: "git", time: { created: Date.now(), updated: Date.now() }, sandboxes: [] }),
   )
-  app.get("/project/:id/directories", (c) => c.json([{ directory: store.directory }]))
+  app.get("/project/:id/directories", (c) => {
+    // Primary directory first, then every distinct live-session directory (no worktree strategy yet).
+    const dirs = new Set<string>([store.directory])
+    for (const s of store.listSessions()) dirs.add(s.directory)
+    return c.json([...dirs].map((directory) => ({ directory })))
+  })
 
   // ---- non-blocking bootstrap batch (SOFT: must resolve 200 JSON) ----
   app.get("/command", (c) => c.json([]))
@@ -111,6 +119,24 @@ export function createApp(store: Store) {
   })
 
   // ---- sessions ----
+
+  // Directory resolution for creates (03-writes-v1.md §1.1): the TUI sends ?directory= as a
+  // QUERY param (never in the body); writes without it carry the URI-encoded
+  // x-opencode-directory header; else fall back to the server's primary directory.
+  const resolveDirectory = (c: any): string => {
+    const q = c.req.query("directory")
+    if (q) return q
+    const h = c.req.header("x-opencode-directory")
+    if (h) {
+      try {
+        return decodeURIComponent(h)
+      } catch {
+        return h
+      }
+    }
+    return store.directory
+  }
+
   app.post("/session", async (c) => {
     const body = await safeBody(c)
     const session = store.createSession({
@@ -119,11 +145,42 @@ export function createApp(store: Store) {
       title: body.title,
       parentID: body.parentID,
       id: body.id,
+      directory: resolveDirectory(c),
     })
     return c.json(session)
   })
 
-  app.get("/session", (c) => c.json(store.listSessions()))
+  // List semantics per docs/contract/09 §3.1: filters compose; sort by time.updated DESC
+  // BEFORE the limit cut (default 100). All query params arrive as strings.
+  app.get("/session", (c) => {
+    const q = c.req.query()
+    let list = store.listSessions()
+    if (q.roots === "true") list = list.filter((s) => !s.parentID)
+    if (q.scope !== "project") {
+      const path = q.path
+      if (path !== undefined && path !== "") {
+        // equals-or-under; empty-string path (cwd == worktree root) matches everything
+        list = list.filter((s) => s.path === path || (s.path !== undefined && s.path.startsWith(path + "/")))
+      } else if (path === undefined && q.directory) {
+        list = list.filter((s) => s.directory === q.directory)
+      }
+    }
+    if (q.search) {
+      const needle = q.search.toLowerCase()
+      list = list.filter((s) => s.title.toLowerCase().includes(needle)) // TITLE substring only
+    }
+    if (q.start) {
+      const start = Number(q.start)
+      if (Number.isFinite(start)) list = list.filter((s) => s.time.updated >= start)
+    }
+    list.sort((a, b) => b.time.updated - a.time.updated)
+    const limit = Number(q.limit ?? "")
+    return c.json(list.slice(0, Number.isFinite(limit) && limit > 0 ? limit : 100))
+  })
+
+  // Busy-only map, {} when idle (09 §3.4). MUST register before /session/:id — Hono matches
+  // in registration order, so the param route would otherwise capture id="status" and 404.
+  app.get("/session/status", (c) => c.json(store.status()))
 
   app.get("/session/:id", (c) => {
     const s = store.getSession(c.req.param("id"))
@@ -139,7 +196,6 @@ export function createApp(store: Store) {
   })
   app.get("/session/:id/todo", (c) => c.json(store.todos(c.req.param("id"))))
   app.get("/session/:id/diff", (c) => c.json([]))
-  app.get("/session/status", (c) => c.json(store.status()))
 
   const resolveModel = (body: any, session: any) => {
     if (body.model?.modelID) return { providerID: body.model.providerID ?? "anthropic", modelID: body.model.modelID, variant: body.variant }
@@ -201,10 +257,17 @@ export function createApp(store: Store) {
 
   app.delete("/session/:id", (c) => {
     const id = c.req.param("id")
-    engines.get(id)?.dispose()
-    engines.delete(id)
-    const ok = store.deleteSession(id)
-    return c.json(ok)
+    if (!store.getSession(id)) return c.json({ name: "NotFoundError", data: { message: "session not found" } }, 404)
+    // Cascade CHILDREN-FIRST (09 §3.5); each deleteSession emits session.deleted {sessionID, info}
+    // (info is required by both TUI consumers) and removes the disk record.
+    const removeTree = (sid: string): void => {
+      for (const child of store.listSessions().filter((s) => s.parentID === sid)) removeTree(child.id)
+      engines.get(sid)?.dispose()
+      engines.delete(sid)
+      store.deleteSession(sid)
+    }
+    removeTree(id)
+    return c.json(true)
   })
 
   app.patch("/session/:id", async (c) => {
@@ -215,9 +278,12 @@ export function createApp(store: Store) {
     return c.json(store.getSession(id))
   })
 
-  app.post("/session/:id/fork", (c) => {
-    const src = store.getSession(c.req.param("id"))
-    const forked = store.createSession({ agent: src?.agent, model: src?.model, title: src?.title })
+  app.post("/session/:id/fork", async (c) => {
+    // Body may carry {messageID} for a point-in-time fork; we still do a FULL fork for now
+    // (the Claude-side transcript has no per-message cut on plain forkSession — limitation).
+    await safeBody(c)
+    const forked = store.forkSession(c.req.param("id"))
+    if (!forked) return c.json({ name: "NotFoundError", data: { message: "session not found" } }, 404)
     return c.json(forked)
   })
 

@@ -146,8 +146,12 @@ export class SessionEngine {
     this.currentEffort = effort
     this.activeModelID = model
     this.activePermissionMode = permissionMode
+    // cwd + resume state come from the store at (re)start time: sessions own their directory,
+    // and a stored claudeSessionId enables lazy restart — a resumed query emits nothing until
+    // the first pushed input (probe-resume finding 5), so arming resume here is free.
+    const resume = this.store.resumeInfo(this.sessionID)
     const options: Options = {
-      cwd: this.directory,
+      cwd: this.store.getSession(this.sessionID)?.directory ?? this.directory,
       model,
       permissionMode,
       includePartialMessages: true,
@@ -158,6 +162,11 @@ export class SessionEngine {
       canUseTool: (toolName, input, opts) => this.onCanUseTool(toolName, input, opts.toolUseID),
     }
     if (effort) options.effort = effort
+    if (resume.claudeSessionId) {
+      options.resume = resume.claudeSessionId
+      // Fork copies inherit the source's uuid; forkSession mints the fork its own on first init.
+      if (resume.forkPending) options.forkSession = true
+    }
     // OPENCLAUDE_ULTRACODE=1 → Settings.ultracode: xhigh effort + standing workflow orchestration.
     // Only takes effect when the account has workflows enabled and the model supports xhigh.
     if (process.env.OPENCLAUDE_ULTRACODE === "1") options.settings = { ultracode: true }
@@ -234,11 +243,12 @@ export class SessionEngine {
     this.stepTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
     this.turnDone = defer<void>()
 
+    // No session_id stamp: it would be an opencode ses_ id, not a Claude UUID; the field is
+    // optional on input and the CLI ignores it.
     this.input.push({
       type: "user",
       message: { role: "user", content: [{ type: "text", text }] },
       parent_tool_use_id: null,
-      session_id: this.sessionID,
     })
 
     await this.turnDone.promise
@@ -387,7 +397,21 @@ export class SessionEngine {
     } catch (err) {
       this.store.error(this.sessionID, { name: "UnknownError", data: { message: String(err) } })
     } finally {
-      this.finishTurn() // stream ended without a result (CLI died / stream error): unblock the POST
+      // Stream over. Unless we were disposed, the CLI died or the stream errored — without a
+      // reset the engine is a zombie (started stays true, q stays set, and the next prompt
+      // hangs forever on turnDone). Dismiss open dialogs, error in-flight main-session tool
+      // parts, then arm a lazy restart: the next prompt re-runs startQuery, which resumes via
+      // the stored claudeSessionId, and the conversation continues.
+      if (!this.disposed) {
+        for (const id of [...this.pendingPermissions.keys()]) this.replyPermission(id, "reject", "Claude process exited", false)
+        for (const id of [...this.pendingQuestions.keys()]) this.rejectQuestion(id)
+        this.failInFlightTools("Claude process exited")
+        this.started = false
+        this.q = null
+        this.abort = new AbortController()
+        this.input = new InputQueue()
+      }
+      this.finishTurn() // unblock the POST whether or not a turn was in flight
     }
   }
 
@@ -415,7 +439,12 @@ export class SessionEngine {
       }
       case "system": {
         const m = msg as SDKMessage & { subtype?: string } & Record<string, unknown>
-        if (m.subtype === "task_started") this.onTaskStarted(m)
+        // init re-fires at the start of EVERY user turn on CLI 2.1.207; the capture is a
+        // SILENT store mutation that no-ops when unchanged. After a fork, the first init's
+        // NEW uuid replaces the inherited one and clears forkPending.
+        if (m.subtype === "init") {
+          if (typeof m.session_id === "string" && m.session_id) this.store.setClaudeSessionId(this.sessionID, m.session_id)
+        } else if (m.subtype === "task_started") this.onTaskStarted(m)
         else if (m.subtype === "task_progress") this.onTaskProgress(m)
         else if (m.subtype === "task_updated") this.onTaskLifecycle(String(m.task_id ?? ""), (m.patch as { status?: string } | undefined)?.status)
         else if (m.subtype === "task_notification") this.onTaskLifecycle(String(m.task_id ?? ""), m.status as string | undefined, typeof m.summary === "string" ? m.summary : undefined)
@@ -573,8 +602,10 @@ export class SessionEngine {
     const toolCtx = this.tools.get(parentToolUseId)
     const title = seed?.description ?? String(toolCtx?.input?.description ?? "Subagent")
     const agent = seed?.agent ?? String(toolCtx?.input?.subagent_type ?? "task")
+    const parentID = toolCtx?.sessionID ?? this.sessionID
     const session = this.store.createSession({
-      parentID: toolCtx?.sessionID ?? this.sessionID,
+      parentID,
+      directory: this.store.getSession(parentID)?.directory, // mirrors inherit the spawning session's dir
       title: `${title} (@${agent} subagent)`,
       agent,
       model: { id: this.lastModel.modelID, providerID: this.lastModel.providerID },
@@ -754,6 +785,13 @@ export class SessionEngine {
       this.store.touchSession(this.sessionID, { cost: A.cost, tokens: A.tokens })
     }
     if (aborted || msg.subtype !== "success") this.failInFlightTools("Aborted")
+    // Stale resume target (probe-resume finding 7): clear the stored uuid silently so the NEXT
+    // restart starts fresh instead of erroring forever; session.error for this turn was already
+    // surfaced above. The iterator throws right after this result — consume()'s catch reports
+    // and its finally self-heals, and finishTurn below finalizes the turn exactly once.
+    if (msg.subtype === "error_during_execution" && Array.isArray(msg.errors) && msg.errors.some((e: unknown) => String(e).includes("No conversation found with session ID"))) {
+      this.store.setClaudeSessionId(this.sessionID, undefined)
+    }
     this.finishTurn()
   }
 

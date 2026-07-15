@@ -17,6 +17,7 @@ export interface Session {
   slug: string
   projectID: string
   directory: string
+  path?: string // cwd relative to the worktree (05-data-model.md §2.1); set by /move, filtered by GET /session
   title: string
   version: string
   parentID?: string
