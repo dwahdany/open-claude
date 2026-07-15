@@ -28,18 +28,19 @@ agent, prompts, tools, and permission model.
 ## Usage
 
 ```sh
-bunx @dwahdany/open-claude --attach
+bunx @dwahdany/open-claude
 ```
 
-That's the whole quickstart. open-claude itself is just the server — the TUI always
-connects to it via opencode's own `opencode attach <url>`. `--attach` simply saves you a
-terminal: after booting, open-claude runs `opencode attach` for you and shuts the server
-down again when you quit the TUI.
+That's the whole quickstart: it starts the server and drops you straight into the opencode
+TUI, attached. Quitting the TUI stops the server. (open-claude itself is just the server —
+the TUI always connects via opencode's own `opencode attach <url>`; the default merely runs
+that for you.)
 
-Equivalently, run the server standalone and connect any opencode client yourself:
+To run the server standalone and connect clients yourself, pass `--serve` (this also
+happens automatically when opencode isn't installed or stdout isn't a terminal):
 
 ```sh
-bunx @dwahdany/open-claude --port 4096 --directory /path/to/your/project
+bunx @dwahdany/open-claude --serve --port 4096 --directory /path/to/your/project
 # in another terminal:
 opencode attach http://localhost:4096
 ```
