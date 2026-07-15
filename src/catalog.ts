@@ -38,9 +38,11 @@ function model(
   }
 }
 
-// Variant keys ARE Agent SDK effort levels (engine.ts variantEffort maps key → Options.effort).
+// Variant keys are Agent SDK effort levels (engine.ts variantEffort maps key → Options.effort)
+// plus "ultracode" → Settings.ultracode (xhigh effort + standing workflow orchestration; only
+// takes effect when the account has workflows enabled and the model supports xhigh).
 // The TUI only reads the keys for its variant picker; the values carry no options.
-const EFFORT_VARIANTS = { low: {}, medium: {}, high: {}, xhigh: {}, max: {} }
+const EFFORT_VARIANTS = { low: {}, medium: {}, high: {}, xhigh: {}, max: {}, ultracode: {} }
 
 export const MODELS: Record<string, ReturnType<typeof model>> = {
   "claude-opus-4-8": model(

@@ -56,7 +56,8 @@ function defer<T>(): Deferred<T> {
 
 const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"])
 
-/** Catalog variant keys are exactly the Agent SDK effort levels (catalog.ts EFFORT_VARIANTS). */
+/** Catalog variant keys are the Agent SDK effort levels plus "ultracode", which is not an
+ *  effort: it maps to Settings.ultracode in startQuery/applyVariant (catalog.ts EFFORT_VARIANTS). */
 export function variantEffort(variant?: string): EffortLevel | undefined {
   return variant && EFFORT_LEVELS.has(variant) ? (variant as EffortLevel) : undefined
 }
@@ -107,7 +108,7 @@ export class SessionEngine {
   private abort = new AbortController()
   private started = false
   private disposed = false
-  private currentEffort: EffortLevel | undefined
+  private currentVariant: string | undefined
   private activeModelID = ""
   private activePermissionMode: Options["permissionMode"]
   private lastModel = { providerID: "anthropic", modelID: "" }
@@ -146,10 +147,10 @@ export class SessionEngine {
     private onCommandsChanged?: (commands: SlashCommand[]) => void, // commands_changed → server cache
   ) {}
 
-  private startQuery(model: string, permissionMode: Options["permissionMode"], effort?: EffortLevel): void {
+  private startQuery(model: string, permissionMode: Options["permissionMode"], variant?: string): void {
     if (this.started) return
     this.started = true
-    this.currentEffort = effort
+    this.currentVariant = variant
     this.activeModelID = model
     this.activePermissionMode = permissionMode
     // cwd + resume state come from the store at (re)start time: sessions own their directory,
@@ -167,15 +168,17 @@ export class SessionEngine {
       systemPrompt: { type: "preset", preset: "claude_code" },
       canUseTool: (toolName, input, opts) => this.onCanUseTool(toolName, input, opts.toolUseID),
     }
+    const effort = variantEffort(variant)
     if (effort) options.effort = effort
     if (resume.claudeSessionId) {
       options.resume = resume.claudeSessionId
       // Fork copies inherit the source's uuid; forkSession mints the fork its own on first init.
       if (resume.forkPending) options.forkSession = true
     }
-    // OPENCLAUDE_ULTRACODE=1 → Settings.ultracode: xhigh effort + standing workflow orchestration.
-    // Only takes effect when the account has workflows enabled and the model supports xhigh.
-    if (process.env.OPENCLAUDE_ULTRACODE === "1") options.settings = { ultracode: true }
+    // Settings.ultracode = xhigh effort + standing workflow orchestration. The env var is a
+    // standing override; the "ultracode" catalog variant opts in per session. Only takes
+    // effect when the account has workflows enabled and the model supports xhigh.
+    if (process.env.OPENCLAUDE_ULTRACODE === "1" || variant === "ultracode") options.settings = { ultracode: true }
     // OPENCLAUDE_SETTING_SOURCES=none ignores the user's ~/.claude allowlists, so every
     // gated tool routes through canUseTool (clean-room permission prompts). Default: load
     // the user's settings, matching normal Claude Code behavior.
@@ -185,17 +188,23 @@ export class SessionEngine {
   }
 
   /**
-   * Mid-session effort changes ride the flag-settings layer (there is no Query.setEffort).
+   * Mid-session variant changes ride the flag-settings layer (there is no Query.setEffort).
    * Settings.effortLevel has no 'max' member, so 'max' picked after the first turn clamps
-   * to 'xhigh'; picking the default (no variant) clears the flag layer again.
+   * to 'xhigh'. "ultracode" rides Settings.ultracode instead of an effort level; null clears
+   * a key back to lower-precedence sources, so the default (no variant) resets both. With
+   * OPENCLAUDE_ULTRACODE=1 the env override is standing and the flag is never cleared here.
    */
-  private async applyEffort(effort: EffortLevel | undefined): Promise<void> {
-    if (effort === this.currentEffort) return
+  private async applyVariant(variant: string | undefined): Promise<void> {
+    if (variant === this.currentVariant) return
+    const effort = variantEffort(variant)
     try {
-      await this.q?.applyFlagSettings({ effortLevel: effort ? (effort === "max" ? "xhigh" : effort) : null })
-      this.currentEffort = effort
+      await this.q?.applyFlagSettings({
+        effortLevel: effort ? (effort === "max" ? "xhigh" : effort) : null,
+        ...(process.env.OPENCLAUDE_ULTRACODE === "1" ? {} : { ultracode: variant === "ultracode" ? true : null }),
+      })
+      this.currentVariant = variant
     } catch {
-      /* control request failed; keep the previous effort and retry on the next change */
+      /* control request failed; keep the previous variant and retry on the next change */
     }
   }
 
@@ -236,9 +245,8 @@ export class SessionEngine {
     if (this.disposed) return
     this.lastModel = { providerID: model.providerID, modelID: model.modelID }
     const permissionMode: Options["permissionMode"] = agent === "plan" ? "plan" : agent === "auto" ? "auto" : "default"
-    const effort = variantEffort(model.variant)
-    this.startQuery(model.modelID, permissionMode, effort)
-    await this.applyEffort(effort)
+    this.startQuery(model.modelID, permissionMode, model.variant)
+    await this.applyVariant(model.variant)
     await this.applyMode(model.modelID, permissionMode)
 
     // Reference shape (09 §5.3 a-b): a user message carrying ONLY a compaction part — the
@@ -273,9 +281,8 @@ export class SessionEngine {
     this.agent = agent
     this.lastModel = { providerID: model.providerID, modelID: model.modelID }
     const permissionMode: Options["permissionMode"] = agent === "plan" ? "plan" : agent === "auto" ? "auto" : "default"
-    const effort = variantEffort(model.variant)
-    this.startQuery(model.modelID, permissionMode, effort)
-    await this.applyEffort(effort)
+    this.startQuery(model.modelID, permissionMode, model.variant)
+    await this.applyVariant(model.variant)
     await this.applyMode(model.modelID, permissionMode)
 
     // Persist + emit the user message and its text part.
