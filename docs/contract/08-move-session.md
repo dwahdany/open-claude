@@ -455,6 +455,9 @@ data: {"directory":"<newDir>","payload":{"id":"evt_…","type":"session.next.mov
 
 ## 5. open-claude implementation notes
 
+*(Pre-implementation analysis, kept for the tradeoff rationale — §6 documents what actually
+shipped and where it deviates.)*
+
 What we must implement vs. can stub for `/move` to function end-to-end:
 
 1. **Must: `POST /experimental/control-plane/move-session`.** Update the session record's
@@ -488,3 +491,79 @@ What we must implement vs. can stub for `/move` to function end-to-end:
 9. Paths must be canonical and byte-stable across `/path`, `/project/current`, directories rows,
    session `directory` fields, and the `session.next.moved` payload — the dialog does exact string
    comparisons (`contains`/`===`) for the current marker and delete guard.
+
+---
+
+## 6. Shim implementation status & deviations (implemented; verified by test/live-move.ts)
+
+Everything in §3 is implemented (src/server.ts "project copies + /move" section, git plumbing
+in src/vcs.ts, copy records + move mutation in src/store.ts). Where the shim deviates from or
+narrows the reference:
+
+1. **`generate-name` makes NO LLM call.** Deterministic adjective-noun slug seeded off an
+   FNV-1a hash of `context` (same task text → same suggestion), random slug when context is
+   absent/empty. Always 200 — the reference also always-200s with a random-slug fallback.
+2. **Single-project shim: no project-identity check on move.** The reference resolves both
+   directories to projects and rejects cross-project moves (`"Destination directory belongs to
+   another project"`). The shim serves exactly one project, so any EXISTING destination
+   directory is accepted; a missing one → 400 `"Destination directory does not exist: <dir>"`.
+   Validation messages otherwise follow the reference (`"Session not found: <id>"`,
+   `"Source is not a Git repository"`, the verbatim apply-conflict message).
+3. **Copy records persist in `project.json`** (state root, 07 §13):
+   `{id, directory, copies: [{directory, strategy, time}]}` — copies survive restarts even
+   with zero sessions in them. Writes are ATOMIC (tmp + rename) and serialized through one
+   writer queue — a torn file would cost the once-forever projectID — and `Store.load`
+   parse-guards the file: corruption degrades to a logged fresh-id rewrite, never a boot
+   crash. `GET /project/{pid}/directories` = primary (strategy-less) +
+   persisted copy rows + distinct live-session directories, deduped in that order.
+   `copy/refresh` prunes rows whose directory vanished and upserts linked worktrees from
+   `git worktree list --porcelain` run in the PRIMARY checkout only (first entry = main → not
+   a copy). `project.directories.updated` is never emitted (the v1.17.19 TUI ignores it, §3.3).
+4. **Move sequence** (order matters): interrupt + dispose a live engine, then wait ~250 ms for
+   CLI teardown to stop appending to the transcript → capture/apply `moveChanges` (only when
+   the two `rev-parse --show-toplevel` roots differ; apply failure aborts the move with the
+   reference message and cleans up NOTHING) → relocate the Claude transcript → store mutation →
+   events → source cleanup (`checkout -- <scope>` + `clean -fd -- <scope>`), matching the
+   reference's capture → apply → publish → cleanup order. The next prompt lazily restarts the
+   engine, which reads the NEW cwd from the store and resumes via the stored Claude uuid.
+5. **Transcript relocation** (probe ground truth in test/probe-cross-cwd-resume.ts): copy
+   `~/.claude/projects/<munge(realpath(old))>/<uuid>.jsonl` (+ the `<uuid>/` sibling dir —
+   subagent transcripts) into `<munge(realpath(new))>/`. If the jsonl is not at the expected
+   munged path, one bounded scan of `~/.claude/projects/*/` finds it. A missing transcript is
+   logged and tolerated — the resume-not-found self-heal (07 §13) starts the session fresh.
+   Source/destination handling depends on uuid ownership (`RelocateMode`, src/vcs.ts): a
+   session and its not-yet-prompted forks share ONE uuid (07 §13 fork mapping), so
+   - sole owner → **move** (delete the source copies; both alive = silent divergent fork);
+   - owner whose uuid an unprompted fork still inherits → **copy** (source stays as the
+     fork's resume seed; a stale same-uuid file at the destination is overwritten);
+   - `forkPending` mover → **seed** (source stays — it belongs to the fork's source session —
+     and an existing destination file is never clobbered: it may be the owner's live
+     transcript). The seed is read once by the fork's first `resume` + `forkSession` init
+     (which mints the fork its own uuid) and then abandoned in place — a small tolerated
+     residue.
+6. **`session.path` derivation**: owning root = longest of (primary, copy directories) that
+   string-contains the destination; `path` = destination relative to it (`""` at a root). A
+   destination under no known root is its own root → `path: ""`. Dual-emit on success:
+   `session.updated` (full info) AND `session.next.moved`, both with the NEW directory in the
+   SSE envelope.
+7. **`GET /vcs/status` is real** (§3.8): porcelain status joined with `diff --numstat HEAD`
+   counts — untracked → `"added"` with 0/0 (the reference stats untracked files individually;
+   the shim reports 0/0 where unknown, also for binary). Non-git or missing directory → `[]`.
+8. **`GET /path`** (§3.9): `directory` = requested `?directory=` (or primary); `worktree` =
+   the directory's OWNING ROOT — longest of (primary, copy dirs) string-containing it, the
+   same rule as `session.path` derivation — falling back to `rev-parse --show-toplevel`,
+   then to the directory itself. The owning-root-first order is deliberate: the primary
+   attach dir is always its own worktree (`worktree === directory`) even when it sits inside
+   a bigger git repo or was given as a non-canonical/symlinked `--directory`, so the TUI's
+   session-list filter (`path = relative(worktree, directory)`, sync.tsx:154-162) stays `""`
+   (inactive) for the primary. Subdirectory answers stay truthful (`worktree` = the owning
+   root) for the dialog's `subdirectory = directory !== worktree` math. Belt-and-braces, the
+   v1 list filter also implements the reference's legacy fallback
+   `(path IS NULL AND directory = :directory)` (09 §3.1) so path-less sessions remain
+   visible under an active `?path=` filter.
+9. **Copy create canonicalizes early**: the parent is realpath'd BEFORE `git worktree add` so
+   the porcelain list, the stored record, and the 200 `{directory}` are byte-identical
+   (macOS `/tmp` symlink). Collision suffixes `-2`..`-10` per §3.4; only `git_worktree` is
+   accepted (`"Project copy strategy unavailable: …"` otherwise).
+10. **Security**: request-supplied paths are never interpolated into shell strings — every git
+    invocation is an argv array (`Bun.spawn(["git", ...])`), patches ride stdin.

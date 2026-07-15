@@ -4,8 +4,10 @@
 //
 // Persistence (docs/contract/07 §13): state root is
 //   (XDG_DATA_HOME | ~/.local/share)/open-claude/project/<munge(realpath(primaryDirectory))>/
-// with project.json {id, directory} (projectID minted once, stable forever — /project/current
-// must match Session.projectID across restarts) and session/<id>.json snapshots. Hydration on
+// with project.json {id, directory, copies} (projectID minted once, stable forever —
+// /project/current must match Session.projectID across restarts; copies are the managed
+// git-worktree rows of doc 08, persisted so they survive restarts even with zero sessions
+// in them) and session/<id>.json snapshots. Hydration on
 // boot writes straight into the private maps — NEVER through the emitting mutations — so a
 // connected TUI does not get the entire history replayed over SSE. `busy` is transient and
 // never persisted; every session loads idle.
@@ -39,7 +41,14 @@ interface SessionFile {
 }
 
 /** Same rule the Claude CLI uses for ~/.claude/projects: every non-alphanumeric char → "-". */
-const munge = (s: string): string => s.replace(/[^A-Za-z0-9]/g, "-")
+export const munge = (s: string): string => s.replace(/[^A-Za-z0-9]/g, "-")
+
+/** Managed project-copy row (doc 08 §3.7): only strategy at this tag is "git_worktree". */
+export interface CopyRecord {
+  directory: string
+  strategy: string
+  time: number
+}
 
 export class Store {
   readonly bus: Bus
@@ -47,8 +56,10 @@ export class Store {
   readonly projectID: string
   private readonly stateDir: string
   private sessions = new Map<string, SessionState>()
+  private copies: CopyRecord[] = []
   private dirty = new Set<string>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
+  private projectFlush: Promise<void> = Promise.resolve() // serializes project.json writers
 
   private constructor(directory: string, projectID: string, stateDir: string) {
     this.directory = directory
@@ -70,16 +81,26 @@ export class Store {
     const stateDir = join(dataHome, "open-claude", "project", munge(real))
     mkdirSync(join(stateDir, "session"), { recursive: true })
 
+    // project.json is load-bearing (the once-forever projectID) and parse-GUARDED: a corrupt
+    // file (external tampering, a pre-atomic-write tear) must degrade to a fresh id + atomic
+    // rewrite, never to a boot-time crash.
     const projectFile = Bun.file(join(stateDir, "project.json"))
-    let projectID: string
+    let projectID: string | undefined
+    let copies: CopyRecord[] = []
     if (await projectFile.exists()) {
-      projectID = ((await projectFile.json()) as { id: string }).id
-    } else {
-      projectID = Id.project()
-      await Bun.write(projectFile, JSON.stringify({ id: projectID, directory }))
+      try {
+        const data = (await projectFile.json()) as { id?: unknown; copies?: unknown }
+        if (typeof data.id === "string" && data.id) projectID = data.id
+        else console.error("open-claude: project.json has no valid id — minting a fresh projectID")
+        if (Array.isArray(data.copies)) copies = data.copies as CopyRecord[]
+      } catch (err) {
+        console.error("open-claude: unreadable project.json — minting a fresh projectID:", err)
+      }
     }
 
-    const store = new Store(directory, projectID, stateDir)
+    const store = new Store(directory, projectID ?? Id.project(), stateDir)
+    store.copies = copies
+    if (!projectID) await store.persistProject() // first boot or healed corruption: write-through
     for (const f of readdirSync(join(stateDir, "session"))) {
       if (!f.endsWith(".json")) continue
       try {
@@ -192,6 +213,51 @@ export class Store {
     this.bus.publish(type, properties, this.sessions.get(sessionID)?.session.directory)
   }
 
+  // ---- project copies (doc 08 §3.3-3.5,3.7; persisted in project.json) ----
+
+  listCopies(): CopyRecord[] {
+    return [...this.copies]
+  }
+
+  /** Insert-or-replace a managed copy row by exact directory (paths are byte-stable per
+   *  doc 08 note 9). Awaited by callers — the record must survive an immediate restart. */
+  async upsertCopy(directory: string, strategy: string): Promise<void> {
+    const existing = this.copies.find((r) => r.directory === directory)
+    if (existing) {
+      if (existing.strategy === strategy) return
+      existing.strategy = strategy
+    } else {
+      this.copies.push({ directory, strategy, time: Date.now() })
+    }
+    await this.persistProject()
+  }
+
+  async removeCopy(directory: string): Promise<boolean> {
+    const before = this.copies.length
+    this.copies = this.copies.filter((r) => r.directory !== directory)
+    if (this.copies.length === before) return false
+    await this.persistProject()
+    return true
+  }
+
+  /** Atomic + serialized project.json write-through. The projectID is minted once and must
+   *  survive any crash (doc 07 §13): tmp + rename so a torn file can never exist on disk,
+   *  one writer at a time so concurrent copy mutations cannot interleave whole-file writes.
+   *  Best-effort like the session flush — failures log, never throw (callers await). */
+  private persistProject(): Promise<void> {
+    const path = join(this.stateDir, "project.json")
+    const next = this.projectFlush
+      .then(async () => {
+        await Bun.write(path + ".tmp", JSON.stringify({ id: this.projectID, directory: this.directory, copies: this.copies }))
+        await rename(path + ".tmp", path)
+      })
+      .catch((err) => {
+        console.error("open-claude: failed to persist project.json:", err)
+      })
+    this.projectFlush = next
+    return next
+  }
+
   // ---- sessions ----
 
   createSession(opts: {
@@ -282,6 +348,21 @@ export class Store {
     this.emit(id, "session.updated", { sessionID: id, info: st.session })
   }
 
+  /** /move mutation (doc 08 §3.1-3.2): directory + path (destination relative to its owning
+   *  root, "" at a root) + time.updated, then DUAL-emit — the session.updated the store
+   *  mutation always produces AND the targeted session.next.moved. Envelope directory is the
+   *  NEW directory for both (emit() reads the already-mutated session). */
+  moveSession(id: string, directory: string, path: string): void {
+    const st = this.sessions.get(id)
+    if (!st) return
+    st.session.directory = directory
+    st.session.path = path
+    st.session.time.updated = Date.now()
+    this.markDirty(id)
+    this.emit(id, "session.updated", { sessionID: id, info: st.session })
+    this.emit(id, "session.next.moved", { timestamp: Date.now(), sessionID: id, location: { directory }, subdirectory: path })
+  }
+
   deleteSession(id: string): boolean {
     const st = this.sessions.get(id)
     if (!st) return false
@@ -306,7 +387,9 @@ export class Store {
 
   setBusy(id: string, busy: boolean): void {
     const st = this.sessions.get(id)
-    if (!st) return
+    // Unchanged value → publish nothing: a double finishTurn (result + consume finally)
+    // must not re-emit session.status idle + session.idle for an already-idle session.
+    if (!st || st.busy === busy) return
     st.busy = busy // transient — deliberately NOT persisted
     this.emit(id, "session.status", { sessionID: id, status: { type: busy ? "busy" : "idle" } })
     if (!busy) this.emit(id, "session.idle", { sessionID: id })

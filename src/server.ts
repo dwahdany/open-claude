@@ -3,10 +3,13 @@
 // JSON 404 for unknown routes, list routes never empty-body, emit SSE side effects on writes.
 
 import { Hono } from "hono"
+import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
+import { join, relative } from "node:path"
 import { AGENTS, CONFIG, CONFIG_PROVIDERS, DEFAULT_MODEL, PROVIDER_LIST } from "./catalog"
 import { SessionEngine } from "./engine"
 import { Id } from "./ids"
 import { Store } from "./store"
+import { applyChanges, captureChanges, cleanupSource, generateCopyName, gitToplevel, isDirtyWorktreeError, relocateTranscript, slugify, vcsStatus, worktreeAdd, worktreeList, worktreeRemove } from "./vcs"
 
 function notFound(method: string, path: string) {
   return { name: "NotFoundError", data: { message: `route not implemented: ${method} ${path}` } }
@@ -31,14 +34,30 @@ export function createApp(store: Store) {
   app.get("/agent", (c) => c.json(AGENTS))
   app.get("/config", (c) => c.json(CONFIG))
 
-  app.get("/path", (c) => {
-    // A ?directory= query (per-session dirs) echoes back as both directory and worktree.
+  /** Owning root = longest of (primary, copies) that string-contains the directory, or null.
+   *  Exact string containment — paths are byte-stable across the API (doc 08 note 9). */
+  const ownerRoot = (dir: string): string | null => {
+    let owner = ""
+    for (const root of [store.directory, ...store.listCopies().map((r) => r.directory)]) {
+      if ((dir === root || dir.startsWith(root + "/")) && root.length > owner.length) owner = root
+    }
+    return owner || null
+  }
+
+  app.get("/path", async (c) => {
+    // doc 08 §3.9 + §6.8: directory = the requested ?directory= (or primary); worktree = its
+    // owning root (primary/copy) — this keeps worktree === directory for the PRIMARY attach
+    // dir even when it sits inside a bigger git repo, so the TUI's session-list path filter
+    // (relative(worktree, directory), sync.tsx:154-162) stays inactive there — else the git
+    // toplevel, else the directory itself. The TUI also derives subdirectory =
+    // directory !== worktree from this, so subdir answers must stay truthful.
     const dir = c.req.query("directory") || store.directory
+    const worktree = ownerRoot(dir) ?? (await gitToplevel(dir)) ?? dir
     return c.json({
       home: process.env.HOME ?? "",
       state: `${process.env.HOME ?? ""}/.local/state/opencode`,
       config: `${process.env.HOME ?? ""}/.config/opencode`,
-      worktree: dir,
+      worktree,
       directory: dir,
     })
   })
@@ -47,10 +66,19 @@ export function createApp(store: Store) {
     c.json({ id: store.projectID, worktree: store.directory, vcs: "git", time: { created: Date.now(), updated: Date.now() }, sandboxes: [] }),
   )
   app.get("/project/:id/directories", (c) => {
-    // Primary directory first, then every distinct live-session directory (no worktree strategy yet).
-    const dirs = new Set<string>([store.directory])
-    for (const s of store.listSessions()) dirs.add(s.directory)
-    return c.json([...dirs].map((directory) => ({ directory })))
+    // doc 08 §3.7 — bare deduped array: primary (strategy-less) first, persisted copy rows
+    // (strategy "git_worktree"), then any distinct live-session directory not already listed.
+    const rows: { directory: string; strategy?: string }[] = []
+    const seen = new Set<string>()
+    const add = (directory: string, strategy?: string) => {
+      if (seen.has(directory)) return
+      seen.add(directory)
+      rows.push(strategy ? { directory, strategy } : { directory })
+    }
+    add(store.directory)
+    for (const copy of store.listCopies()) add(copy.directory, copy.strategy)
+    for (const s of store.listSessions()) add(s.directory)
+    return c.json(rows)
   })
 
   // ---- non-blocking bootstrap batch (SOFT: must resolve 200 JSON) ----
@@ -62,7 +90,9 @@ export function createApp(store: Store) {
   app.get("/provider/auth", (c) => c.json({}))
   app.get("/vcs", (c) => c.json({ branch: "" }))
   app.get("/vcs/diff", (c) => c.json([]))
-  app.get("/vcs/status", (c) => c.json([]))
+  // REAL status (doc 08 §3.8): non-empty results are what gate the TUI's file-changes
+  // dialog and therefore moveChanges:true on move-session. Non-git/missing dir → [].
+  app.get("/vcs/status", async (c) => c.json(await vcsStatus(c.req.query("directory") || store.directory)))
   app.get("/experimental/workspace", (c) => c.json([]))
   app.get("/experimental/workspace/status", (c) => c.json([]))
   app.get("/experimental/capabilities", (c) => c.json({ backgroundSubagents: false }))
@@ -118,6 +148,155 @@ export function createApp(store: Store) {
     })
   })
 
+  // ---- project copies + /move (docs/contract/08-move-session.md) ----
+
+  const copyError = (c: any, message: string, forceRequired?: boolean) =>
+    c.json({ name: "ProjectCopyError", data: { message, ...(forceRequired ? { forceRequired: true } : {}) } }, 400)
+
+  // Reconcile the copies list (§3.3): prune rows whose directory vanished, discover linked
+  // worktrees of the PRIMARY repo (first porcelain entry = main checkout → not a copy).
+  // A ?location[directory]= query may be present; it is ignored (single-project shim).
+  app.post("/experimental/project/:projectID/copy/refresh", async (c) => {
+    for (const copy of store.listCopies()) {
+      if (!existsSync(copy.directory)) await store.removeCopy(copy.directory)
+    }
+    const worktrees = await worktreeList(store.directory) // [] when the primary is not a repo
+    for (const dir of worktrees.slice(1)) await store.upsertCopy(dir, "git_worktree")
+    return c.body(null, 204)
+  })
+
+  // ALWAYS 200 {name} (§3.6). No LLM call: deterministic adjective-noun slug seeded off the
+  // context hash — the reference also always-200s with a random-slug fallback.
+  app.post("/experimental/project/:projectID/copy/generate-name", async (c) => {
+    const body = await safeBody(c)
+    return c.json({ name: generateCopyName(typeof body.context === "string" ? body.context : undefined) })
+  })
+
+  // Create a git-worktree copy (§3.4): body {strategy, directory:<PARENT>, name} → 200
+  // {directory:<canonical abs copy dir>}. Collision suffix -2..-10, detached HEAD.
+  app.post("/experimental/project/:projectID/copy", async (c) => {
+    const body = await safeBody(c)
+    try {
+      if (body.strategy !== "git_worktree") return copyError(c, `Project copy strategy unavailable: ${body.strategy}`)
+      let parent = typeof body.directory === "string" ? body.directory : ""
+      if (!parent.startsWith("/")) return copyError(c, `Invalid project copy directory: ${parent || "(missing)"}`)
+      const slug = slugify(String(body.name ?? "")) || generateCopyName()
+      mkdirSync(parent, { recursive: true })
+      parent = realpathSync(parent) // canonical BEFORE worktree add so git records the same path we persist
+      let copyDir: string | null = null
+      for (let i = 1; i <= 10; i++) {
+        const candidate = join(parent, i === 1 ? slug : `${slug}-${i}`)
+        if (!existsSync(candidate)) {
+          copyDir = candidate
+          break
+        }
+      }
+      if (!copyDir) return copyError(c, `Project copy destination already exists: ${join(parent, slug)}`)
+      const res = await worktreeAdd(store.directory, copyDir)
+      if (!res.ok) return copyError(c, res.stderr.trim() || "git worktree add failed")
+      const directory = realpathSync(copyDir)
+      await store.upsertCopy(directory, "git_worktree")
+      return c.json({ directory })
+    } catch (err) {
+      return copyError(c, String(err))
+    }
+  })
+
+  // Remove a copy (§3.5): DELETE with JSON body {directory, force}. A dirty worktree on a
+  // non-forced remove → 400 with data.forceRequired:true (the TUI's confirm-and-retry cue).
+  app.delete("/experimental/project/:projectID/copy", async (c) => {
+    const body = await safeBody(c)
+    const directory = typeof body.directory === "string" ? body.directory : ""
+    const record = store.listCopies().find((r) => r.directory === directory)
+    if (!record) return copyError(c, `Invalid project copy directory: ${directory || "(missing)"}`)
+    const res = await worktreeRemove(store.directory, directory, body.force === true)
+    if (!res.ok) return copyError(c, res.stderr.trim() || "git worktree remove failed", body.force !== true && isDirtyWorktreeError(res.stderr))
+    await store.removeCopy(directory)
+    return c.body(null, 204)
+  })
+
+  /** path = dest relative to its owning root ("" at a root, or when dest is its own root). */
+  const subdirPath = (dest: string): string => {
+    const owner = ownerRoot(dest)
+    return owner && dest !== owner ? dest.slice(owner.length + 1) : ""
+  }
+
+  // Move a session (§3.1-3.2): stop the engine, optionally transfer uncommitted changes,
+  // relocate the Claude transcript, mutate the session (dual-emits session.updated +
+  // session.next.moved), THEN clean the source. 204 on success.
+  app.post("/experimental/control-plane/move-session", async (c) => {
+    const body = await safeBody(c)
+    const moveError = (message: string) => c.json({ name: "MoveSessionError", data: { message } }, 400)
+    const sessionID = typeof body.sessionID === "string" ? body.sessionID : ""
+    const session = store.getSession(sessionID)
+    if (!session) return moveError(`Session not found: ${sessionID}`)
+    const destination = typeof body.destination?.directory === "string" ? body.destination.directory : ""
+    if (!destination) return moveError("Destination directory is required")
+    if (session.directory === destination) return c.body(null, 204) // silent no-op (§3.1 step 1)
+    let destStat
+    try {
+      destStat = statSync(destination)
+    } catch {
+      /* missing */
+    }
+    if (!destStat?.isDirectory()) return moveError(`Destination directory does not exist: ${destination}`)
+    const oldDirectory = session.directory
+
+    // a. Stop a live engine BEFORE relocating files: CLI teardown keeps appending to the
+    // transcript briefly, so give it ~250ms to settle.
+    const engine = engines.get(sessionID)
+    if (engine) {
+      await engine.interrupt()
+      engine.dispose()
+      engines.delete(sessionID)
+      await Bun.sleep(250)
+    }
+
+    // b. moveChanges only across DIFFERENT resolved roots (§3.1 step 3): capture at the
+    // source, apply at the destination; cleanup is deferred until after the events (step 5).
+    let cleanup: (() => Promise<void>) | null = null
+    if (body.moveChanges === true) {
+      const sourceRoot = await gitToplevel(oldDirectory)
+      if (!sourceRoot) return moveError("Source is not a Git repository")
+      const destRoot = (await gitToplevel(destination)) ?? destination
+      if (sourceRoot !== destRoot) {
+        // Scope = the session's subdirectory within its root, "." at the root itself.
+        let scope: string
+        try {
+          scope = relative(sourceRoot, realpathSync(oldDirectory)) || "."
+        } catch {
+          scope = "."
+        }
+        const captured = await captureChanges(sourceRoot, scope)
+        if (!captured.ok) return moveError(captured.message)
+        if (captured.patch) {
+          const applied = await applyChanges(destRoot, captured.patch)
+          if (!applied.ok) return moveError("Unable to apply your changes in the destination directory. The files may conflict with existing changes.")
+          cleanup = () => cleanupSource(sourceRoot, scope)
+        }
+      }
+    }
+
+    // c. Relocate the Claude transcript (resume is scoped to munge(realpath(cwd)) — probe
+    // header in test/probe-cross-cwd-resume.ts). Missing transcript = log and continue.
+    // SHARED-uuid guard: until a fork's first init re-uuids it, the fork and its source
+    // share ONE transcript (store.forkSession) — moving that jsonl would strand the other
+    // sharer's resume. forkPending mover → "seed"; owner another session still inherits
+    // from → "copy"; sole owner → "move" (see RelocateMode in src/vcs.ts).
+    const { claudeSessionId, forkPending } = store.resumeInfo(sessionID)
+    if (claudeSessionId) {
+      const shared = store.listSessions().some((s) => s.id !== sessionID && store.resumeInfo(s.id).claudeSessionId === claudeSessionId)
+      relocateTranscript(claudeSessionId, oldDirectory, destination, forkPending ? "seed" : shared ? "copy" : "move")
+    }
+
+    // d+e. Mutate + dual-emit (session.updated + session.next.moved, new-dir envelopes).
+    store.moveSession(sessionID, destination, subdirPath(destination))
+
+    // Source cleanup ONLY after a successful apply AND after the events (§3.1 step 5).
+    if (cleanup) await cleanup()
+    return c.body(null, 204)
+  })
+
   // ---- sessions ----
 
   // Directory resolution for creates (03-writes-v1.md §1.1): the TUI sends ?directory= as a
@@ -159,8 +338,11 @@ export function createApp(store: Store) {
     if (q.scope !== "project") {
       const path = q.path
       if (path !== undefined && path !== "") {
-        // equals-or-under; empty-string path (cwd == worktree root) matches everything
-        list = list.filter((s) => s.path === path || (s.path !== undefined && s.path.startsWith(path + "/")))
+        // equals-or-under, PLUS the reference's legacy fallback for rows without a stored
+        // path — `(path IS NULL AND directory = :directory)` (09 §3.1): shim-created
+        // sessions carry no path until they are moved, so without it a TUI whose path
+        // filter is active would see an empty list. Empty-string path matches everything.
+        list = list.filter((s) => s.path === path || (s.path !== undefined && s.path.startsWith(path + "/")) || (s.path === undefined && !!q.directory && s.directory === q.directory))
       } else if (path === undefined && q.directory) {
         list = list.filter((s) => s.directory === q.directory)
       }
@@ -207,6 +389,13 @@ export function createApp(store: Store) {
       .filter((p) => p?.type === "text" && !p.synthetic && p.text)
       .map((p) => p.text)
       .join("\n\n")
+  // noReply persists the message verbatim INCLUDING synthetic parts (the post-move reminder,
+  // doc 08 §2.2 step 5); textOf strips synthetic only so they never re-prompt the model.
+  const rawTextOf = (parts: any[]): string =>
+    (parts ?? [])
+      .filter((p) => p?.type === "text" && p.text)
+      .map((p) => p.text)
+      .join("\n\n")
 
   app.post("/session/:id/message", async (c) => {
     const id = c.req.param("id")
@@ -221,7 +410,7 @@ export function createApp(store: Store) {
       // Persist a user message without running the model.
       const user = store.newUserMessage(id, agent, model)
       store.addMessage(id, user)
-      store.putPart(id, store.newPart(id, user.id, { type: "text", text, synthetic: true }))
+      store.putPart(id, store.newPart(id, user.id, { type: "text", text: rawTextOf(body.parts), synthetic: true }))
       return c.json({ info: user, parts: store.messages(id).find((m) => m.info.id === user.id)?.parts ?? [] })
     }
     await engine.prompt(text, model, agent)
@@ -242,7 +431,7 @@ export function createApp(store: Store) {
     if (body.noReply) {
       const user = store.newUserMessage(id, agent, model)
       store.addMessage(id, user)
-      store.putPart(id, store.newPart(id, user.id, { type: "text", text, synthetic: true }))
+      store.putPart(id, store.newPart(id, user.id, { type: "text", text: rawTextOf(body.parts), synthetic: true }))
     } else {
       void engineFor(id, agent).prompt(text, model, agent)
     }

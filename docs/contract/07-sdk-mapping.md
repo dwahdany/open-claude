@@ -1108,8 +1108,11 @@ Error:
 State root: `(XDG_DATA_HOME | ~/.local/share)/open-claude/project/<munge(realpath(primaryDirectory))>/`
 where `munge` replaces every `[^A-Za-z0-9]` with `-` (same rule as `~/.claude/projects`). Layout:
 
-- `project.json` — `{ id, directory }`; the `prj_` id is minted once and reused forever
-  (`GET /project/current` must be stable and match `Session.projectID` across restarts).
+- `project.json` — `{ id, directory, copies }` (copies = managed worktree rows, doc 08 §6.3);
+  the `prj_` id is minted once and reused forever (`GET /project/current` must be stable and
+  match `Session.projectID` across restarts). Written atomically (tmp + rename) through a
+  serializing queue; `Store.load()` parse-guards it — a corrupt file degrades to a logged
+  fresh-id rewrite, never a boot crash.
 - `session/<sessionID>.json` — `{ session, messages: WithParts[] (ascending id order — the
   order array is implicit), todos, claudeSessionId?, forkPending? }`. `busy` is transient and
   never persisted; everything hydrates idle.
@@ -1132,6 +1135,9 @@ test/probe-cross-cwd-resume.ts headers):
 - Resume-not-found (`"No conversation found with session ID"` in an `error_during_execution`
   result) clears `claudeSessionId` silently so the next restart starts fresh; the turn still
   surfaces `session.error`, and the iterator's trailing throw is absorbed by consume().
+- Deliberate teardown is silent: `dispose()` (move-session, delete) aborts the query and the
+  iterator throws `"Operation aborted"` — consume()'s catch drops it when `disposed` is set
+  (the TUI toasts every `session.error` except `MessageAbortedError`).
 
 Fork mapping (`POST /session/:id/fork` → src/store.ts forkSession): new opencode session copying
 directory/path/agent/model/title; messages/parts/todos deep-copied with FRESH sequentially-minted

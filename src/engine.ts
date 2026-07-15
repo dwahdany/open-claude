@@ -116,6 +116,7 @@ export class SessionEngine {
   // Per-turn state (main session)
   private assistant: AssistantMessage | null = null
   private turnDone: Deferred<void> | null = null
+  private resultErrored = false // this turn already surfaced session.error from an error result
   private partObjs = new Map<string, Part>() // partID → live Part object (same ref as in store)
   private blocks = new Map<number, BlockCtx>() // content_block index → ctx (reset per step)
   private textAccum = new Map<string, string>()
@@ -241,6 +242,7 @@ export class SessionEngine {
     this.blocks.clear()
     this.textAccum.clear()
     this.stepTokens = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+    this.resultErrored = false
     this.turnDone = defer<void>()
 
     // No session_id stamp: it would be an opencode ses_ id, not a Claude UUID; the field is
@@ -395,7 +397,13 @@ export class SessionEngine {
         }
       }
     } catch (err) {
-      this.store.error(this.sessionID, { name: "UnknownError", data: { message: String(err) } })
+      // The iterator throws right AFTER an error result (probe-verified double on the
+      // resume-not-found path), and dispose()'s abort makes it throw "Operation aborted"
+      // (deliberate teardown on move/delete — the TUI toasts every session.error except
+      // MessageAbortedError). Only report throws that no result announced and that
+      // teardown didn't cause.
+      if (!this.resultErrored && !this.disposed) this.store.error(this.sessionID, { name: "UnknownError", data: { message: String(err) } })
+      this.resultErrored = false
     } finally {
       // Stream over. Unless we were disposed, the CLI died or the stream errored — without a
       // reset the engine is a zombie (started stays true, q stays set, and the next prompt
@@ -777,9 +785,11 @@ export class SessionEngine {
       if (aborted) {
         A.error = { name: "MessageAbortedError", data: { message: "Aborted" } }
         this.store.error(this.sessionID, A.error)
+        this.resultErrored = true
       } else if (msg.subtype !== "success") {
         A.error = { name: "UnknownError", data: { message: String(msg.result ?? (Array.isArray(msg.errors) ? msg.errors.join("; ") : "error")) } }
         this.store.error(this.sessionID, A.error)
+        this.resultErrored = true // the iterator's trailing throw must not re-surface this
       }
       this.store.updateMessage(this.sessionID, A)
       this.store.touchSession(this.sessionID, { cost: A.cost, tokens: A.tokens })
@@ -787,8 +797,9 @@ export class SessionEngine {
     if (aborted || msg.subtype !== "success") this.failInFlightTools("Aborted")
     // Stale resume target (probe-resume finding 7): clear the stored uuid silently so the NEXT
     // restart starts fresh instead of erroring forever; session.error for this turn was already
-    // surfaced above. The iterator throws right after this result — consume()'s catch reports
-    // and its finally self-heals, and finishTurn below finalizes the turn exactly once.
+    // surfaced above (resultErrored suppresses the catch-path duplicate when the iterator
+    // throws right after this result). consume()'s finally self-heals, and finishTurn below
+    // finalizes the turn exactly once (setBusy no-ops on the unchanged idle value).
     if (msg.subtype === "error_during_execution" && Array.isArray(msg.errors) && msg.errors.some((e: unknown) => String(e).includes("No conversation found with session ID"))) {
       this.store.setClaudeSessionId(this.sessionID, undefined)
     }
