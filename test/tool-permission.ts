@@ -1,6 +1,7 @@
 // Integration test: prompt that forces a bash tool → permission.asked fires → reply "once"
 // → tool runs to completion → turn ends. Exercises the full permission bridge over HTTP+SSE.
-// Run against a live shim: bun run test/tool-permission.ts [baseURL]
+// Run against a live shim (start it with a pinned port, e.g. `bun index.ts --serve --port 4096`):
+//   bun run test/tool-permission.ts [baseURL]
 
 const BASE = process.argv[2] ?? "http://localhost:4096"
 

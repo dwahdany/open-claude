@@ -36,16 +36,20 @@ TUI, attached. Quitting the TUI stops the server. (open-claude itself is just th
 the TUI always connects via opencode's own `opencode attach <url>`; the default merely runs
 that for you.)
 
+The server listens on `127.0.0.1` with an OS-assigned free port (same defaults as
+`opencode serve`), so multiple instances run side by side without colliding. Pass
+`--port <n>` if you need a stable address.
+
 To run the server standalone and connect clients yourself, pass `--serve` (this also
 happens automatically when opencode isn't installed or stdout isn't a terminal):
 
 ```sh
-bunx @dwahdany/open-claude --serve --port 4096 --directory /path/to/your/project
-# in another terminal:
-opencode attach http://localhost:4096
+bunx @dwahdany/open-claude --serve --directory /path/to/your/project
+# prints e.g. "open-claude listening on http://127.0.0.1:52341" — in another terminal:
+opencode attach http://127.0.0.1:52341
 ```
 
-From a checkout: `bun install && bun run start -- --port 4096`.
+From a checkout: `bun install && bun run start`.
 
 `--directory` is the working directory the Claude Code agent operates in (defaults to the
 shim's cwd). Then use the opencode TUI exactly as normal: type prompts, watch streaming
