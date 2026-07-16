@@ -114,7 +114,10 @@ export interface PermissionRequest {
 export interface QuestionInfo {
   question: string
   header: string
-  options: { label: string; description: string }[]
+  // preview is NOT in the vendor schema: the TUI reads only label/description (and ignores
+  // unknown fields — no runtime validation in the generated SDK client). The shim folds
+  // preview content into description for display and keeps the raw field for other clients.
+  options: { label: string; description: string; preview?: string }[]
   multiple?: boolean
   custom?: boolean
 }

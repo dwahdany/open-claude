@@ -69,6 +69,7 @@ set `OPENCLAUDE_NO_ALIAS_PROMPT=1` to suppress the offer entirely.
 | `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. |
 | `OPENCLAUDE_NO_ALIAS_PROMPT=1` | Never offer the first-run `oclaude` shell alias. |
 | `OPENCLAUDE_NO_UPDATE_CHECK=1` | Never check npm for a newer version. |
+| `OPENCLAUDE_NO_QUESTION_NOTES=1` | Drop the synthetic "Notes" tab from question dialogs — restores one-keystroke submit on single questions; free text is still available via "Type your own answer". |
 
 ### Updating
 
@@ -109,7 +110,12 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
   (`task_progress` ticks, with `agentProgressSummaries` AI status lines, closed by the
   completion summary). Requires the account-gated Workflows feature.
 - **Questions**: `AskUserQuestion` maps to opencode's question dialog; selected labels return
-  to the model via `updatedInput.answers`.
+  to the model via `updatedInput.answers`. Option **previews** (mockups, code snippets) fold
+  into the option description as quote-barred lines (line-budgeted so the dialog can't outgrow
+  the terminal, which would clip with no scroll). A trailing **Notes** tab lets you attach a
+  free-text note to your answer — it returns via `updatedInput.annotations`, which the CLI
+  renders into the tool result (` notes: …`), and shows in the transcript as `note: …`.
+  Disable with `OPENCLAUDE_NO_QUESTION_NOTES=1`.
 - **`/config`**: bare `/config` renders your current Claude Code settings (with the file each
   value comes from) instantly in the transcript — headless, the CLI could only print its usage
   dump. `/config key=value` still passes through to the CLI and persists.

@@ -71,6 +71,24 @@ interface PendingQuestion {
   resolve: (r: PermissionResult) => void
   input: Record<string, unknown>
   request: QuestionRequest
+  notes: boolean // a synthetic trailing "Notes" question was appended to request.questions
+}
+
+// The stock TUI question dialog renders only {label, description} per option and has no
+// notes affordance. Previews fold into the description (the TUI renders \n and word-wraps,
+// but a dialog taller than the terminal bottom-clips with no scroll — hence a line budget
+// per question, split across options that carry previews).
+const PREVIEW_LINE_BUDGET = 24
+const NOTES_HEADER = "Notes"
+const NO_NOTE_LABEL = "No note"
+
+/** Quote-bar each preview line under the description, clamped to maxLines. */
+export function foldPreview(description: string, preview: string, maxLines: number): string {
+  const lines = preview.trimEnd().split("\n")
+  const shown = lines.length > maxLines ? lines.slice(0, Math.max(1, maxLines - 1)) : lines
+  const quoted = shown.map((l) => `│ ${l}`)
+  if (shown.length < lines.length) quoted.push(`│ … (+${lines.length - shown.length} more preview lines)`)
+  return description ? `${description}\n${quoted.join("\n")}` : quoted.join("\n")
 }
 
 interface BlockCtx {
@@ -389,12 +407,30 @@ export class SessionEngine {
 
   private askQuestion(input: Record<string, unknown>, toolUseID: string, signal?: AbortSignal): Promise<PermissionResult> {
     const raw = Array.isArray(input.questions) ? (input.questions as Record<string, unknown>[]) : []
-    const questions: QuestionInfo[] = raw.map((q) => ({
-      question: String(q?.question ?? ""),
-      header: String(q?.header ?? ""),
-      options: Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]).map((o) => ({ label: String(o?.label ?? ""), description: String(o?.description ?? "") })) : [],
-      multiple: q?.multiSelect === true,
-    }))
+    const questions: QuestionInfo[] = raw.map((q) => {
+      const opts = Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : []
+      const previews = opts.filter((o) => typeof o?.preview === "string" && o.preview !== "").length
+      const budget = previews ? Math.max(3, Math.floor(PREVIEW_LINE_BUDGET / previews)) : 0
+      return {
+        question: String(q?.question ?? ""),
+        header: String(q?.header ?? ""),
+        options: opts.map((o) => {
+          const label = String(o?.label ?? "")
+          const description = String(o?.description ?? "")
+          const preview = typeof o?.preview === "string" && o.preview !== "" ? o.preview : undefined
+          return preview ? { label, description: foldPreview(description, preview, budget), preview } : { label, description }
+        }),
+        multiple: q?.multiSelect === true,
+      }
+    })
+    const notes = process.env.OPENCLAUDE_NO_QUESTION_NOTES !== "1" && questions.length > 0
+    if (notes)
+      questions.push({
+        question: "Add a note to your answer? (optional)",
+        header: NOTES_HEADER,
+        options: [{ label: NO_NOTE_LABEL, description: "Send the answer as-is" }],
+        multiple: false,
+      })
     const request: QuestionRequest = {
       id: Id.question(),
       sessionID: this.sessionID,
@@ -402,7 +438,7 @@ export class SessionEngine {
       tool: { messageID: this.assistant?.id ?? "", callID: toolUseID },
     }
     const deferred = defer<PermissionResult>()
-    this.pendingQuestions.set(request.id, { resolve: deferred.resolve, input, request })
+    this.pendingQuestions.set(request.id, { resolve: deferred.resolve, input, request, notes })
     signal?.addEventListener("abort", () => this.rejectQuestion(request.id), { once: true })
     this.store.bus.publish("question.asked", { ...request })
     return deferred.promise
@@ -414,15 +450,35 @@ export class SessionEngine {
     if (!pending) return false
     this.pendingQuestions.delete(requestID)
     this.store.bus.publish("question.replied", { sessionID: this.sessionID, requestID, answers })
-    // The TUI's question tool renderer reads metadata.answers (string[][]) from the tool part.
+    const questions = pending.request.questions
+    const asked = pending.notes ? questions.length - 1 : questions.length // questions the model actually asked
+    const note = pending.notes
+      ? (answers[asked] ?? [])
+          .filter((a) => a && a !== NO_NOTE_LABEL)
+          .join("\n")
+          .trim()
+      : ""
+    // The TUI's question tool renderer reads metadata.answers (string[][]) from the tool part,
+    // iterating the model's ORIGINAL questions — so the synthetic Notes answer is stripped and
+    // the note appended to the first answer (extra strings render joined with ", ").
+    const metaAnswers = Array.from({ length: asked }, (_, i) => [...(answers[i] ?? [])])
+    if (note) metaAnswers[0]?.push(`note: ${note}`)
     const toolCtx = pending.request.tool ? this.tools.get(pending.request.tool.callID) : undefined
-    if (toolCtx) toolCtx.extraMeta = { ...toolCtx.extraMeta, answers }
+    if (toolCtx) toolCtx.extraMeta = { ...toolCtx.extraMeta, answers: metaAnswers }
     const byQuestion: Record<string, string> = {}
-    pending.request.questions.forEach((q, i) => {
+    questions.slice(0, asked).forEach((q, i) => {
       const a = answers[i] ?? []
       if (a.length) byQuestion[q.question] = a.join(", ")
     })
-    pending.resolve({ behavior: "allow", updatedInput: { ...pending.input, answers: byQuestion } })
+    // The note rides updatedInput.annotations on the first question: the CLI renders it in the
+    // tool_result as ` notes: <text>` right after that question's answer (probe-verified,
+    // test/probe-question-annotations.ts).
+    const firstQuestion = questions[0]?.question
+    const annotations = note && firstQuestion !== undefined ? { [firstQuestion]: { notes: note } } : undefined
+    pending.resolve({
+      behavior: "allow",
+      updatedInput: { ...pending.input, answers: byQuestion, ...(annotations ? { annotations } : {}) },
+    })
     return true
   }
 
