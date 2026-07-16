@@ -1,0 +1,70 @@
+# Publishes to npm whenever a version bump lands on main, then tags v<version>
+# and creates the GitHub release. Auth is npm trusted publishing (OIDC) — no
+# NPM_TOKEN secret; the trusted publisher for this repo/workflow is configured
+# on npmjs.com. The publish step uses the npm CLI (>= 11.5.1 required for OIDC;
+# bun publish doesn't support it yet — oven-sh/bun#24855).
+
+name: Publish
+
+on:
+  push:
+    branches: [main]
+    paths: [package.json]
+  workflow_dispatch:
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write # push the release tag + GitHub release
+  id-token: write # mint the OIDC token for npm trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether this version is already on npm
+        id: version
+        run: |
+          PKG=$(jq -r .name package.json)
+          VERSION=$(jq -r .version package.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if npm view "$PKG@$VERSION" version >/dev/null 2>&1; then
+            echo "$PKG@$VERSION already published — nothing to do"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publishing $PKG@$VERSION"
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.version.outputs.new == 'true'
+
+      # prepublishOnly runs `bun run typecheck`, so it needs devDependencies.
+      - run: bun install --frozen-lockfile
+        if: steps.version.outputs.new == 'true'
+
+      - uses: actions/setup-node@v4
+        if: steps.version.outputs.new == 'true'
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish to npm
+        if: steps.version.outputs.new == 'true'
+        run: |
+          npm install -g npm@latest
+          npm publish
+
+      - name: Tag and create GitHub release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            --target "$GITHUB_SHA" \
+            --title "v${{ steps.version.outputs.version }}" \
+            --generate-notes
