@@ -564,3 +564,48 @@ Enter reaches `POST /session/:id/command`, which routes `command === "compact"` 
 engine entry point (instructions appended after the slash) — the same real compaction as
 the palette's `POST /summarize`. Every other TUI palette slash name/alias IS filtered out
 of the list so the palette stays the single dispatch path for them.
+
+## 6. POST /session/:id/command `config` — read-only settings view (shim deviation)
+
+Headless, the CLI's `/config` can only print its usage dump (`Usage: /config key=value ...`,
+exit 1) — the interactive settings menu lives in Claude Code's own TUI, which isn't running
+behind the shim. So the command route special-cases it (src/server.ts, before the
+name-validation step; src/config-view.ts):
+
+- **Bare `/config`** (empty `arguments`): the shim renders the current settings itself as an
+  instant synthetic turn — user message `"/config"` + completed assistant message (text part
+  with `time{start,end}`, `finish:"stop"`, `time.completed`; then `session.updated`). No
+  engine is spawned, busy is never set, and the intercept sits BEFORE the command-cache
+  validation so it works even while the boot warm is still pending. The POST responds
+  `{info, parts}` like any command.
+- **`/config key=value ...`**: passes through to the CLI as a normal blocking slash-command
+  turn — the CLI validates, persists, and prints per-key confirmations ("Set Model to
+  sonnet"). Changes apply to engines started afterwards (options are read at CLI process
+  start), which the view's header states.
+
+### 6.1 Where the CLI stores /config keys (probed, CLI 2.1.x)
+
+Probed by setting every usage-listed key once under a throwaway `CLAUDE_CONFIG_DIR` and
+diffing (2026-07). Writes land in THREE files, most under a RENAMED key
+(src/config-view.ts `CONFIG_KEYS` is the authoritative map):
+
+| destination | keys (stored name where renamed) |
+|---|---|
+| settings chain — written to user `settings.json` except where noted | askUserQuestionTimeout, autoCompact→`autoCompactEnabled`, autoScroll→`autoScrollEnabled`, checkpoints→`fileCheckpointingEnabled`, editor→`editorMode`, language (value transformed: `en`→`English`), model, notifChannel→`preferredNotifChannel`, outputStyle (written to project `.claude/settings.local.json`), permissionMode→`permissions.defaultMode`, progressBar→`terminalProgressBarEnabled`, recap→`awaySummaryEnabled`, reduceMotion→`prefersReducedMotion` (project-local), switchModelsOnFlag, teammateMode, theme, thinking→`alwaysThinkingEnabled`, tips→`spinnerTipsEnabled` (project-local), turnDuration→`showTurnDuration`, useAutoModeDuringPlan, verbose, workflowKeywordTriggerEnabled, workflows→`enableWorkflows`, worktreeBaseRef→`worktree.baseRef` |
+| global state `~/.claude.json` (or `$CLAUDE_CONFIG_DIR/.claude.json`), top-level | autoConnectIde, chrome→`claudeInChromeDefaultEnabled`, copyFullResponse, copyOnSelect, defaultToAgentsView, externalEditorContext, gitignore→`respectGitignore`, leftArrowOpensAgents, prStatus→`prStatusFooterEnabled`, teammateDefaultModel, workflowSizeGuideline |
+
+Reads mirror the CLI's settings precedence for the settings chain —
+`<project>/.claude/settings.local.json` > `<project>/.claude/settings.json` >
+`$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`) — project paths
+resolved against the OWNING session's directory. Unset keys have no on-disk trace (defaults
+are compiled into the CLI) and render `(default)`. `promptSuggestionEnabled` appears in the
+usage dump but the CLI setter rejects it ("isn't a /config setting") — kept in the view for
+usage-list fidelity.
+
+Caveats stated in the view header: settings changes apply to sessions whose engine starts
+afterwards, and `model`/`permissionMode` are overridden per turn by the TUI's own
+model/agent pickers.
+
+Verified: `test/config-view.test.ts` (storage map, precedence, `CLAUDE_CONFIG_DIR`,
+malformed files, synthetic turn against a real Store) and a live PTY run — stock TUI typed
+`/config` (palette accept + submit), full table rendered, session stayed idle.

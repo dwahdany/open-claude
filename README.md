@@ -110,6 +110,9 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
   completion summary). Requires the account-gated Workflows feature.
 - **Questions**: `AskUserQuestion` maps to opencode's question dialog; selected labels return
   to the model via `updatedInput.answers`.
+- **`/config`**: bare `/config` renders your current Claude Code settings (with the file each
+  value comes from) instantly in the transcript — headless, the CLI could only print its usage
+  dump. `/config key=value` still passes through to the CLI and persists.
 - Session hydration: reopening a session replays its transcript.
 
 ## Verified
@@ -155,5 +158,6 @@ Source layout:
 | `src/store.ts` | in-memory sessions/messages/parts; keeps REST state and SSE in sync |
 | `src/engine.ts` | one Claude Agent SDK `query()` per session; maps SDK stream → opencode events |
 | `src/tools.ts` | Claude Code tool name/input → opencode tool rendering contract |
+| `src/config-view.ts` | read-only `/config` bridge: current-settings view from the CLI's three config files |
 | `src/server.ts` | Hono routes (bootstrap, SSE, session CRUD, prompt, permissions, stubs) |
 | `index.ts` | entry point |

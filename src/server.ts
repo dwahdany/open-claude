@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
 import { AGENTS, CONFIG, CONFIG_PROVIDERS, DEFAULT_MODEL, PROVIDER_LIST } from "./catalog"
 import { CommandCache } from "./commands"
+import { configView } from "./config-view"
 import { SessionEngine } from "./engine"
 import { Id } from "./ids"
 import { Store } from "./store"
@@ -454,13 +455,6 @@ export function createApp(store: Store) {
     if (!session) return c.json({ name: "NotFoundError", data: { message: "session not found" } }, 404)
     const body = await safeBody(c)
     const name = typeof body.command === "string" ? body.command : ""
-    const list = await commands.list()
-    if (!list.some((cmd) => cmd.name === name)) {
-      // Reference behavior (09 §2.2 step 1): session.error SSE (the TUI toasts it) + 400
-      // {"_tag":"BadRequest"} — never 404 for unknown NAMES.
-      store.error(id, { name: "UnknownError", data: { message: `Command not found: "${name}". Available commands: ${list.map((x) => x.name).join(", ")}` } })
-      return c.json({ _tag: "BadRequest" }, 400)
-    }
     const agent = body.agent ?? session.agent ?? "build"
     // body.model is a "providerID/modelID" STRING split on the FIRST slash (09 §2.1);
     // fall back to the session model.
@@ -471,6 +465,18 @@ export function createApp(store: Store) {
         ? { providerID: body.model.slice(0, slash), modelID: body.model.slice(slash + 1), variant: body.variant }
         : { ...base, variant: body.variant ?? base.variant }
     const args = typeof body.arguments === "string" ? body.arguments : ""
+    // Bare /config: render current settings from disk instead of forwarding — headless the
+    // CLI can only print its usage dump (09 §6). Intercepted BEFORE the name validation so
+    // it needs neither the command-cache warm nor an engine spawn ("config" is a CLI
+    // built-in, always present). With args it still passes through and persists.
+    if (name === "config" && !args.trim()) return c.json(await configView(store, id, model, agent))
+    const list = await commands.list()
+    if (!list.some((cmd) => cmd.name === name)) {
+      // Reference behavior (09 §2.2 step 1): session.error SSE (the TUI toasts it) + 400
+      // {"_tag":"BadRequest"} — never 404 for unknown NAMES.
+      store.error(id, { name: "UnknownError", data: { message: `Command not found: "${name}". Available commands: ${list.map((x) => x.name).join(", ")}` } })
+      return c.json({ _tag: "BadRequest" }, 400)
+    }
     const engine = engineFor(id, agent)
     if (name === "compact") await engine.compact(args.trim() || undefined, model, agent)
     else await engine.prompt("/" + name + (args ? " " + args : ""), model, agent)
