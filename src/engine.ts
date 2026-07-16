@@ -9,6 +9,7 @@
 // what the TUI reads to show live progress and navigate into the child transcript.
 
 import { query, type EffortLevel, type Options, type PermissionResult, type Query, type SDKMessage, type SDKUserMessage, type SlashCommand } from "@anthropic-ai/claude-agent-sdk"
+import { canonModelID } from "./catalog"
 import { Id } from "./ids"
 import { newPermissionRequest, type Store } from "./store"
 import { flattenToolResult, mapToolInput, mapToolName, toolMetadata, toolTitle } from "./tools"
@@ -169,7 +170,7 @@ export class SessionEngine {
     if (this.started) return
     this.started = true
     this.currentVariant = variant
-    this.activeModelID = model
+    this.activeModelID = canonModelID(model)
     this.activePermissionMode = permissionMode
     // cwd + resume state come from the store at (re)start time: sessions own their directory,
     // and a stored claudeSessionId enables lazy restart — a resumed query emits nothing until
@@ -226,12 +227,17 @@ export class SessionEngine {
     }
   }
 
-  /** Model/permission-mode changes after turn 1 ride the streaming control channel. */
+  /** Model/permission-mode changes after turn 1 ride the streaming control channel.
+   *  activeModelID tracks the CLI's ACTUAL model (adopted from init/message_start, not just
+   *  our own writes), so a CLI-side drift — e.g. a raw "/model X" passthrough from a non-TUI
+   *  client — is re-asserted back to the picker's choice here on the next turn (setModel wins
+   *  over an earlier /model: probe test/probe-model-switch.ts Q4). */
   private async applyMode(modelID: string, permissionMode: Options["permissionMode"]): Promise<void> {
     try {
-      if (modelID !== this.activeModelID) {
+      const want = canonModelID(modelID)
+      if (want !== this.activeModelID) {
         await this.q?.setModel(modelID)
-        this.activeModelID = modelID
+        this.activeModelID = want
       }
       if (permissionMode !== this.activePermissionMode) {
         await this.q?.setPermissionMode(permissionMode!)
@@ -567,7 +573,7 @@ export class SessionEngine {
         // stream_events (unknown-command output and similar local command stdout) and would
         // otherwise be invisible. Forwarded subagent messages (parent_tool_use_id set) are
         // mirrored into the child session.
-        if (m.parent_tool_use_id) this.onChildAssistant(m.parent_tool_use_id, m.message?.content)
+        if (m.parent_tool_use_id) this.onChildAssistant(m.parent_tool_use_id, m.message?.content, m.message?.model)
         else if (m.message?.model === "<synthetic>") this.onSyntheticAssistant(m.message?.content)
         break
       }
@@ -594,6 +600,10 @@ export class SessionEngine {
         // forkPending.
         if (m.subtype === "init") {
           if (typeof m.session_id === "string" && m.session_id) this.store.setClaudeSessionId(this.sessionID, m.session_id)
+          // init.model is the CLI's authoritative current model, re-reported every turn:
+          // adopt it so applyMode compares the picker's choice against the TRUTH, not our
+          // last write — a drifted CLI gets re-asserted on the next turn.
+          if (typeof m.model === "string" && m.model) this.activeModelID = canonModelID(m.model)
         } else if (m.subtype === "task_started") this.onTaskStarted(m)
         else if (m.subtype === "task_progress") this.onTaskProgress(m)
         else if (m.subtype === "task_updated") this.onTaskLifecycle(String(m.task_id ?? ""), (m.patch as { status?: string } | undefined)?.status)
@@ -685,6 +695,15 @@ export class SessionEngine {
     this.store.putPart(this.sessionID, part)
   }
 
+  /** Stamp an assistant message with the model that actually served it, canon-mapped so the
+   *  TUI's catalog lookups keep working; no-op (no event) when already correct. */
+  private restampModel(sessionID: string, A: AssistantMessage, served: string): void {
+    const id = canonModelID(served)
+    if (A.modelID === id) return
+    A.modelID = id
+    this.store.updateMessage(sessionID, A)
+  }
+
   private onStreamEvent(event: any): void {
     const A = this.assistant
     if (!A) return
@@ -692,6 +711,14 @@ export class SessionEngine {
     switch (event.type) {
       case "message_start": {
         this.blocks.clear()
+        // The model serving THIS call: adopt it (drift surfaces here a turn before init) and
+        // restamp the assistant message so the transcript records what actually ran — the
+        // TUI's context gauge reads limit.context off the stamped modelID.
+        const served = event.message?.model
+        if (typeof served === "string" && served && served !== "<synthetic>") {
+          this.activeModelID = canonModelID(served)
+          this.restampModel(this.sessionID, A, served)
+        }
         // Seed this API call's usage: input+cache arrive here, output accrues via message_delta.
         const u = event.message?.usage ?? {}
         this.stepTokens = {
@@ -900,10 +927,13 @@ export class SessionEngine {
   }
 
   /** Forwarded subagent assistant message: append its blocks to the child transcript. */
-  private onChildAssistant(parentToolUseId: string, content: unknown): void {
+  private onChildAssistant(parentToolUseId: string, content: unknown, model?: unknown): void {
     if (!Array.isArray(content)) return
     const c = this.childFor(parentToolUseId)
     const A = this.childAssistant(c)
+    // Subagents run their own models (agent defs, Task model overrides) — the child message
+    // opens stamped with the parent's request model; correct it from the forwarded message.
+    if (typeof model === "string" && model && model !== "<synthetic>") this.restampModel(c.sessionID, A, model)
     const now = Date.now()
     for (const block of content as any[]) {
       if (block?.type === "text") {

@@ -83,6 +83,19 @@ export const MODELS: Record<string, ReturnType<typeof model>> = {
 
 export const DEFAULT_MODEL = "claude-sonnet-5"
 
+/** Map a CLI-reported model id onto the catalog id the TUI knows: exact match, or a dated
+ *  variant in either direction ("claude-sonnet-5-20260201" ↔ "claude-sonnet-5"). Unknown ids
+ *  pass through raw — the TUI then renders them without context-limit metadata, which is the
+ *  honest fallback. */
+export function canonModelID(id: string): string {
+  if (MODELS[id]) return id
+  const dated = (long: string, short: string) => long.startsWith(short + "-") && /^\d{8}$/.test(long.slice(short.length + 1))
+  for (const c of Object.keys(MODELS)) {
+    if (dated(id, c) || dated(c, id)) return c
+  }
+  return id
+}
+
 export const PROVIDER = {
   id: "anthropic",
   name: "Anthropic",

@@ -9,6 +9,7 @@ import { AGENTS, CONFIG, CONFIG_PROVIDERS, DEFAULT_MODEL, PROVIDER_LIST } from "
 import { CommandCache } from "./commands"
 import { configView } from "./config-view"
 import { SessionEngine } from "./engine"
+import { modelView } from "./model-view"
 import { Id } from "./ids"
 import { Store } from "./store"
 import { applyChanges, captureChanges, cleanupSource, generateCopyName, gitToplevel, isDirtyWorktreeError, relocateTranscript, slugify, vcsStatus, worktreeAdd, worktreeList, worktreeRemove } from "./vcs"
@@ -470,6 +471,12 @@ export function createApp(store: Store) {
     // it needs neither the command-cache warm nor an engine spawn ("config" is a CLI
     // built-in, always present). With args it still passes through and persists.
     if (name === "config" && !args.trim()) return c.json(await configView(store, id, model, agent))
+    // /model (bare AND with args): read-only view (09 §6.2). The TUI's picker re-sends its
+    // model with every prompt, so a CLI-side switch could never stick — it would only desync
+    // the footer from what actually serves the turns (probe: test/probe-model-switch.ts).
+    // "model" is deliberately NOT shadowed from GET /command, so the stock TUI always routes
+    // it here rather than as prompt text the CLI would execute.
+    if (name === "model") return c.json(modelView(store, id, model, agent, args.trim()))
     const list = await commands.list()
     if (!list.some((cmd) => cmd.name === name)) {
       // Reference behavior (09 §2.2 step 1): session.error SSE (the TUI toasts it) + 400

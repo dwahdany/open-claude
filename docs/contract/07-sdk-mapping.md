@@ -835,8 +835,8 @@ Conventions for this section:
 | SDK | opencode emission |
 |---|---|
 | TUI `POST /session/:id/message` (prompt) | create User message + TextPart(s)/FilePart(s); emit `message.updated{info:user}` + `message.part.updated` per part; emit `session.status{status:{type:"busy"}}`. Push `SDKUserMessage` into the query's input iterable. |
-| `system/init` (SDK:4284) | No TUI event required. Record `session_id` (for `resume` on process restart), `tools`, `model`, `permissionMode`, `slash_commands`, `capabilities`. Optionally emit `session.updated` if the session's model/agent changed. |
-| `stream_event message_start` (parent_tool_use_id=null) | ensure `A` exists → emit `message.updated{info:A}`; emit `message.part.updated{part: StepStartPart{}}` (opencode emits step-start per API step, processor.ts:424-433). |
+| `system/init` (SDK:4284) | No TUI event required. Record `session_id` (for `resume` on process restart), `tools`, `model`, `permissionMode`, `slash_commands`, `capabilities`. **Shim: adopt `model` (canonModelID-mapped) into the engine's model tracking** — init re-fires every turn and reports the CLI's ACTUAL model, so a CLI-side drift (e.g. a raw `/model X` passthrough from a non-TUI client) is seen and the next turn's applyMode re-asserts the picker's model via `setModel` (probe test/probe-model-switch.ts: `setModel` wins over an earlier `/model`, ids round-trip verbatim; live: test/live-model-sync.ts). |
+| `stream_event message_start` (parent_tool_use_id=null) | ensure `A` exists → emit `message.updated{info:A}`; emit `message.part.updated{part: StepStartPart{}}` (opencode emits step-start per API step, processor.ts:424-433). **Shim: `event.message.model` is the model SERVING this call** (a drift surfaces here one turn before init) — adopt it and restamp `A.modelID` when different (`message.updated`), so the transcript and the TUI's context gauge (`provider.models[last.modelID].limit.context`, prompt/index.tsx:274) reflect what actually ran. Forwarded subagent assistant messages restamp their child message the same way (subagents run their own models). |
 
 ### 10.2 Text streaming
 

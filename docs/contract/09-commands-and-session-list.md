@@ -565,7 +565,7 @@ engine entry point (instructions appended after the slash) — the same real com
 the palette's `POST /summarize`. Every other TUI palette slash name/alias IS filtered out
 of the list so the palette stays the single dispatch path for them.
 
-## 6. POST /session/:id/command `config` — read-only settings view (shim deviation)
+## 6. POST /session/:id/command — read-only views: `config`, `model` (shim deviation)
 
 Headless, the CLI's `/config` can only print its usage dump (`Usage: /config key=value ...`,
 exit 1) — the interactive settings menu lives in Claude Code's own TUI, which isn't running
@@ -609,3 +609,34 @@ model/agent pickers.
 Verified: `test/config-view.test.ts` (storage map, precedence, `CLAUDE_CONFIG_DIR`,
 malformed files, synthetic turn against a real Store) and a live PTY run — stock TUI typed
 `/config` (palette accept + submit), full table rendered, session stayed idle.
+
+### 6.2 `model` — read-only model view (src/model-view.ts)
+
+The CLI's `/model` is a real session-scoped switch ("Set model to Sonnet 5 for this session
+only"), but under the shim it can never work as intended, because **the TUI's model picker is
+authoritative and unreachable from the server**:
+
+- The picker re-sends its selection with EVERY prompt/command (`prompt/index.tsx` submit —
+  `model: selectedModel` on `session.prompt`, `providerID/modelID` string on
+  `session.command`), and the server cannot move the picker mid-session (the TUI re-reads it
+  from the last user message only on session SWITCH, `prompt/index.tsx:310-331`).
+- So a forwarded `/model X` flips the CLI, the footer keeps showing the picker's model, the
+  NEXT turn silently runs on X (the shim's `applyMode` believed the CLI unchanged), and the
+  session desyncs indefinitely — probed in `test/probe-model-switch.ts`: the `/model` turn
+  makes no API call and even its own `system/init` still reports the OLD model; the switch is
+  only visible from the NEXT turn's `init.model` / `message_start.message.model`.
+
+Hence the route intercepts `model` — bare AND with args, before name validation — and renders
+a synthetic turn (same scaffolding as `/config`): current model + variant, the catalog with
+the active row marked, and a pointer to the TUI's model list (`/models`, ctrl+x m). Alias
+arguments (`sonnet`, `opus[1m]`, dated ids…) resolve via `resolveModelArg` so the view can
+name the model the user asked for. `model` is deliberately NOT in `SHADOWED_TUI_SLASHES`:
+keeping it in GET /command means the stock TUI always routes it to the command route (name
+match, `prompt/index.tsx:1070-1090`) instead of sending it as prompt text the CLI would
+execute (`test/probe-slash-commands.ts` finding 6: slash recognized at message start).
+
+Drift that bypasses the route (raw `/model X` prompt text from a non-TUI client) self-heals
+in the engine — `init.model` / `message_start.model` adoption + picker re-assert, and the
+drifted turn's assistant message is restamped with the model that actually served it (07
+§10.1). Verified end-to-end in `test/live-model-sync.ts` (intercept never busies the session;
+drifted turn restamped `claude-sonnet-5`; next turn re-asserted to the picker's haiku).

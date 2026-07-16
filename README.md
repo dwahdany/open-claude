@@ -101,7 +101,11 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
   reverting to "no variant" falls back to the session's initial effort, not the global default).
 - **Mid-session switching**: model and build↔plan agent changes on later turns ride
   `setModel`/`setPermissionMode`; turns are serialized per session; Esc-Esc aborts map to
-  `MessageAbortedError` (no error toast) and in-flight tool parts are errored out.
+  `MessageAbortedError` (no error toast) and in-flight tool parts are errored out. The TUI's
+  model picker is authoritative: the engine tracks the CLI's *actual* model every turn and
+  re-asserts the picker's choice if anything drifts CLI-side, and each assistant message is
+  stamped with the model that actually served it (so the context gauge divides by the right
+  window even across a drifted turn).
 - **Subagents**: Task/Agent runs (and workflow-spawned agents with a spawning tool call) mirror
   into opencode **child sessions** — the task tool part links via `metadata.sessionId`, so the
   TUI shows live progress and "view subagents" navigates into the child transcript.
@@ -119,6 +123,10 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
 - **`/config`**: bare `/config` renders your current Claude Code settings (with the file each
   value comes from) instantly in the transcript — headless, the CLI could only print its usage
   dump. `/config key=value` still passes through to the CLI and persists.
+- **`/model`**: intercepted as a read-only view (current model, catalog, pointer to `/models`).
+  The CLI's session-scoped switch could never stick here — the picker re-sends its model with
+  every prompt — so forwarding it would only desync the footer from the model actually serving
+  the turns.
 - Session hydration: reopening a session replays its transcript.
 
 ## Verified
@@ -133,6 +141,10 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
   tool_result + transcript metadata, "No note"/loose reply shapes/kill-switch all round-trip.
 - `test/pty_question.py` — the real TUI renders folded previews and the Notes tab; a typed note
   round-trips on-screen (CLI-side contract in `test/probe-question-annotations.ts`).
+- `test/live-model-sync.ts` — `/model` intercept (read-only view, session never busy) and
+  model-drift self-heal: a raw `/model` passthrough flips the CLI, the drifted turn's message
+  is restamped with the serving model, the next turn re-asserts the picker's choice
+  (CLI-side contract in `test/probe-model-switch.ts`).
 - `test/workflow-render.ts` — Workflow run → task part linked to a child session with a live
   progress log, busy→idle on completion.
 - `test/sdk-subagent-probe.ts` — documents how the SDK forwards subagent content (complete

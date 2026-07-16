@@ -134,16 +134,14 @@ export function renderConfigRows(rows: ConfigRow[]): string {
   ].join("\n")
 }
 
-/** Synthesize the /config transcript turn: user "/config" + completed assistant listing.
- *  Same store factories and event order as a real turn (03 §3), minus busy/step parts —
- *  the turn is instant and never touches an engine. Returns the {info, parts} the command
- *  route responds with. */
-export async function configView(store: Store, sessionID: string, model: { providerID: string; modelID: string; variant?: string }, agent: string): Promise<WithParts> {
-  const directory = store.getSession(sessionID)?.directory ?? store.directory
-  const text = renderConfigRows(await readConfigRows(directory))
+/** Synthesize an instant local-command turn: user message with the typed slash text + a
+ *  completed assistant message carrying the rendered view. Same store factories and event
+ *  order as a real turn (03 §3), minus busy/step parts — never touches an engine. Returns
+ *  the {info, parts} the command route responds with. */
+export function syntheticTurn(store: Store, sessionID: string, model: { providerID: string; modelID: string; variant?: string }, agent: string, userText: string, text: string): WithParts {
   const user = store.newUserMessage(sessionID, agent, model)
   store.addMessage(sessionID, user)
-  store.putPart(sessionID, store.newPart(sessionID, user.id, { type: "text", text: "/config" }))
+  store.putPart(sessionID, store.newPart(sessionID, user.id, { type: "text", text: userText }))
   const assistant = store.newAssistantMessage(sessionID, user.id, agent, model.providerID, model.modelID, model.variant)
   store.addMessage(sessionID, assistant)
   const now = Date.now()
@@ -154,4 +152,10 @@ export async function configView(store: Store, sessionID: string, model: { provi
   store.updateMessage(sessionID, assistant)
   store.touchSession(sessionID, {})
   return { info: assistant, parts: [part] }
+}
+
+/** The /config transcript turn: current settings rendered from disk. */
+export async function configView(store: Store, sessionID: string, model: { providerID: string; modelID: string; variant?: string }, agent: string): Promise<WithParts> {
+  const directory = store.getSession(sessionID)?.directory ?? store.directory
+  return syntheticTurn(store, sessionID, model, agent, "/config", renderConfigRows(await readConfigRows(directory)))
 }
