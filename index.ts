@@ -3,6 +3,7 @@
 // Default: start the server AND hand the terminal to `opencode attach`.
 // --serve (or a non-TTY, or no opencode CLI) runs the server standalone and prints the URL.
 
+import { offerAliasOnFirstRun } from "./src/alias"
 import { createApp } from "./src/server"
 import { Store } from "./src/store"
 
@@ -36,13 +37,18 @@ Requires the opencode CLI v${OPENCODE_PIN} (https://opencode.ai) and Claude auth
 
 Env:
   OPENCLAUDE_SETTING_SOURCES=none  ignore ~/.claude allowlists (prompt for every tool)
-  OPENCLAUDE_ULTRACODE=1           enable ultracode (needs workflows + xhigh model)`)
+  OPENCLAUDE_ULTRACODE=1           enable ultracode (needs workflows + xhigh model)
+  OPENCLAUDE_NO_ALIAS_PROMPT=1     never offer the first-run \`oclaude\` shell alias`)
   process.exit(0)
 }
 
 const port = Number(arg("port", "0")) // 0 = let the OS pick a free port (matches `opencode serve`)
 const hostname = arg("hostname", "127.0.0.1")
 const directory = arg("directory", process.cwd())
+
+// Before any server output: on the very first interactive run, offer to save an
+// `oclaude` shell alias. No-op on non-TTYs and every run after the first.
+await offerAliasOnFirstRun()
 
 // Loads project.json (stable projectID) + every persisted session BEFORE serving.
 const store = await Store.load(directory)

@@ -56,12 +56,18 @@ shim's cwd). Then use the opencode TUI exactly as normal: type prompts, watch st
 text and tool calls, approve/deny permission prompts. First `bunx` run downloads the
 bundled Claude Code engine (~230MB, cached); later runs start instantly.
 
+On the very first interactive run, open-claude offers to save an `oclaude` shell alias
+(one appended line in your `~/.zshrc` / `~/.bashrc` / fish config, pointing at however you
+launched it — global install, `bunx`, or a checkout). Answer once and it never asks again;
+set `OPENCLAUDE_NO_ALIAS_PROMPT=1` to suppress the offer entirely.
+
 ### Config
 
 | Env var | Effect |
 |---|---|
 | `OPENCLAUDE_SETTING_SOURCES=none` | Ignore your `~/.claude` allowlists so **every** gated tool routes through opencode's permission dialog (clean-room prompts). Default: load your Claude Code settings, matching normal Claude Code behavior. |
 | `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. |
+| `OPENCLAUDE_NO_ALIAS_PROMPT=1` | Never offer the first-run `oclaude` shell alias. |
 
 ## What works
 
