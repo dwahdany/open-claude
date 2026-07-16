@@ -471,6 +471,16 @@ prompt cannot resolve an agent/model. `agent.color` (optional) drives styling;
 session creation flows. Real native agents: `build`, `plan` (primary), `general`,
 `explore` (subagent) — `agent/agent.ts:140-207`.
 
+Shim behavior — dynamic order (launch-default mode): the TUI **never persists its agent
+selection** (`agentStore.current` starts undefined and falls back to `agents().at(0)`),
+so list order is the only lever over the boot mode. The shim persists the last
+client-sent agent (any prompt/command on a top-level session — the TUI sends its current
+agent with every one) to the global `settings.json` (see `store.ts noteDefaults`) and
+serves that agent FIRST, reading the file fresh on every GET. Colors are pinned on the
+catalog rows (`build`=secondary, `plan`=accent, `auto`=success — exactly what the TUI's
+index-based fallback assigned to the fixed order) because `local.tsx color()` is
+index-based and a reorder would otherwise rotate the styling between launches.
+
 Minimal JSON:
 
 ```json
@@ -499,6 +509,17 @@ Minimal JSON (perfectly valid): `{}` — or steer the default model explicitly:
 ```json
 { "model": "anthropic/claude-sonnet-5" }
 ```
+
+Shim behavior — dynamic `model` (launch-default model): `config.model` sits ABOVE the
+TUI's own persisted recent-models list in its fallback chain (`args.model` →
+`config.model` → `model.json` recent → provider default, `local.tsx:197-234`), so a
+static value here would pin every launch to one model no matter what the user picks.
+The shim instead persists the last client-sent model (the picker re-sends its selection
+with every prompt/command) to the global
+`(XDG_DATA_HOME | ~/.local/share)/open-claude/settings.json` under `defaults.model`,
+and serves it here — fresh disk read per GET, invalid refs degrade to
+`anthropic/claude-sonnet-5`. Together with §5.3's agent ordering this is what makes the
+model+mode pair survive restarts, globally across projects.
 
 ### 5.5 `GET /path`
 

@@ -44,7 +44,7 @@ export function renderModelView(model: { providerID: string; modelID: string; va
           : `Switch models in the model list — /models (ctrl+x m).`,
     )
   } else {
-    lines.push(`Current model: ${currentName} (${model.providerID}/${model.modelID}${variant})`, "", "Switch with the model list — /models (ctrl+x m); the picker's choice rides every prompt. Variants (effort) live in the variant picker.")
+    lines.push(`Current model: ${currentName} (${model.providerID}/${model.modelID}${variant})`, "", "Switch with the model list — /models (ctrl+x m); the picker's choice rides every prompt and is saved as the global launch default (so is the current mode). Variants (effort) live in the variant picker.")
   }
   const width = Math.max(...Object.values(MODELS).map((m) => m.name.length))
   lines.push(

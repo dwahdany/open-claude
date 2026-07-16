@@ -116,12 +116,17 @@ export const PROVIDER_LIST = {
   connected: ["anthropic"],
 }
 
+// Colors are PINNED to what the TUI's index-based fallback assigned when the order was
+// fixed [build, plan, auto] (local.tsx colors() = [secondary, accent, success, ...]).
+// /agent is now served with the persisted default agent first (server.ts), and without
+// explicit colors a reorder would rotate every agent's color between launches.
 export const AGENTS = [
   {
     name: "build",
     description: "The default agent. Executes tools based on configured permissions.",
     mode: "primary",
     native: true,
+    color: "secondary",
     permission: [],
     options: {},
   },
@@ -130,6 +135,7 @@ export const AGENTS = [
     description: "Plan mode. Disallows all edit tools.",
     mode: "primary",
     native: true,
+    color: "accent",
     permission: [],
     options: {},
   },
@@ -138,9 +144,33 @@ export const AGENTS = [
     description: "Auto mode. A model classifier approves/denies tool permissions; only risky actions prompt.",
     mode: "primary",
     native: true,
+    color: "success",
     permission: [],
     options: {},
   },
 ]
 
-export const CONFIG = { model: `anthropic/${DEFAULT_MODEL}` }
+/** AGENTS with `first` moved to the front — the TUI boots on `agents().at(0)` and never
+ *  persists its agent selection itself, so list order IS the startup mode. Unknown or
+ *  absent names keep the stock order. */
+export function orderedAgents(first?: string) {
+  const hit = AGENTS.find((a) => a.name === first)
+  if (!hit) return AGENTS
+  return [hit, ...AGENTS.filter((a) => a !== hit)]
+}
+
+export const DEFAULT_MODEL_REF = `anthropic/${DEFAULT_MODEL}`
+
+/** Validate + normalize a "providerID/modelID" ref against the catalog (dated ids canon
+ *  to their catalog row). Anything else → undefined — a bad persisted/client value must
+ *  fall back to the stock default, never reach the TUI, whose isModelValid would silently
+ *  discard it anyway. */
+export function validModelRef(ref: string | undefined): string | undefined {
+  if (!ref) return undefined
+  const slash = ref.indexOf("/")
+  if (slash <= 0) return undefined
+  const providerID = ref.slice(0, slash)
+  const modelID = canonModelID(ref.slice(slash + 1))
+  if (providerID !== "anthropic" || !MODELS[modelID]) return undefined
+  return `${providerID}/${modelID}`
+}

@@ -640,3 +640,8 @@ in the engine — `init.model` / `message_start.model` adoption + picker re-asse
 drifted turn's assistant message is restamped with the model that actually served it (07
 §10.1). Verified end-to-end in `test/live-model-sync.ts` (intercept never busies the session;
 drifted turn restamped `claude-sonnet-5`; next turn re-asserted to the picker's haiku).
+
+Because the picker's model (and the current agent) ride every prompt AND every command —
+including the intercepted `/model` and `/config` turns — the command route also feeds
+`noteDefaults` (server.ts): the pair is persisted to the global `settings.json` and served
+back by `GET /config` / `GET /agent` as the next launch's defaults (01 §5.3-5.4).

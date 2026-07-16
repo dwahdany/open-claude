@@ -43,6 +43,12 @@ interface SessionFile {
 /** Same rule the Claude CLI uses for ~/.claude/projects: every non-alphanumeric char → "-". */
 export const munge = (s: string): string => s.replace(/[^A-Za-z0-9]/g, "-")
 
+/** Global (cross-project) launch defaults, persisted in settings.json under the data root. */
+export interface GlobalDefaults {
+  model?: string // "providerID/modelID"
+  agent?: string
+}
+
 /** Managed project-copy row (doc 08 §3.7): only strategy at this tag is "git_worktree". */
 export interface CopyRecord {
   directory: string
@@ -60,6 +66,7 @@ export class Store {
   private dirty = new Set<string>()
   private flushTimer: ReturnType<typeof setTimeout> | null = null
   private projectFlush: Promise<void> = Promise.resolve() // serializes project.json writers
+  private settingsFlush: Promise<void> = Promise.resolve() // serializes settings.json writers
 
   private constructor(directory: string, projectID: string, stateDir: string) {
     this.directory = directory
@@ -255,6 +262,60 @@ export class Store {
         console.error("open-claude: failed to persist project.json:", err)
       })
     this.projectFlush = next
+    return next
+  }
+
+  // ---- global settings (settings.json at the data root, shared by every project) ----
+
+  /** Resolved per call, not cached at load: tests re-point XDG_DATA_HOME, and the file is
+   *  shared across concurrently running instances. */
+  static settingsFile(): string {
+    const dataHome = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
+    return join(dataHome, "open-claude", "settings.json")
+  }
+
+  private static async readSettings(): Promise<Record<string, unknown>> {
+    try {
+      const data = await Bun.file(Store.settingsFile()).json()
+      if (data && typeof data === "object" && !Array.isArray(data)) return data as Record<string, unknown>
+    } catch {
+      /* missing or corrupt — treated as empty, healed by the next write */
+    }
+    return {}
+  }
+
+  /** Fresh disk read every call: /config and /agent are served from this, and a sibling
+   *  instance (another project's server) may have updated the launch defaults since boot. */
+  async globalDefaults(): Promise<GlobalDefaults> {
+    const d = (await Store.readSettings()).defaults as Record<string, unknown> | undefined
+    return {
+      model: typeof d?.model === "string" ? d.model : undefined,
+      agent: typeof d?.agent === "string" ? d.agent : undefined,
+    }
+  }
+
+  /** Merge-persist the launch defaults (undefined fields keep their stored value). Same
+   *  discipline as project.json: serialized writers, tmp + rename, log-never-throw —
+   *  callers fire-and-forget from the prompt path. Read-merge-write against the live file
+   *  so two projects' servers converge on last-writer-wins instead of clobbering whole
+   *  files, and unchanged values skip the write entirely. */
+  noteDefaults(patch: GlobalDefaults): Promise<void> {
+    const next = this.settingsFlush
+      .then(async () => {
+        const settings = await Store.readSettings()
+        const prev = (settings.defaults ?? {}) as Record<string, unknown>
+        const defaults = { ...prev }
+        if (patch.model !== undefined) defaults.model = patch.model
+        if (patch.agent !== undefined) defaults.agent = patch.agent
+        if (defaults.model === prev.model && defaults.agent === prev.agent) return
+        const path = Store.settingsFile()
+        await Bun.write(path + ".tmp", JSON.stringify({ ...settings, defaults }, null, 2))
+        await rename(path + ".tmp", path)
+      })
+      .catch((err) => {
+        console.error("open-claude: failed to persist settings.json:", err)
+      })
+    this.settingsFlush = next
     return next
   }
 

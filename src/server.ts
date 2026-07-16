@@ -5,7 +5,7 @@
 import { Hono } from "hono"
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs"
 import { join, relative } from "node:path"
-import { AGENTS, CONFIG, CONFIG_PROVIDERS, DEFAULT_MODEL, PROVIDER_LIST } from "./catalog"
+import { AGENTS, CONFIG_PROVIDERS, DEFAULT_MODEL, DEFAULT_MODEL_REF, orderedAgents, PROVIDER_LIST, validModelRef } from "./catalog"
 import { CommandCache } from "./commands"
 import { configView } from "./config-view"
 import { SessionEngine } from "./engine"
@@ -38,8 +38,14 @@ export function createApp(store: Store) {
   // ---- bootstrap (HARD) ----
   app.get("/config/providers", (c) => c.json(CONFIG_PROVIDERS))
   app.get("/provider", (c) => c.json(PROVIDER_LIST))
-  app.get("/agent", (c) => c.json(AGENTS))
-  app.get("/config", (c) => c.json(CONFIG))
+  // /agent + /config carry the GLOBAL launch defaults (01 §5.3-5.4): the TUI boots on
+  // `agents().at(0)` and on config.model (its model fallback chain is args → config.model
+  // → its own recent list → provider default), and it never persists either selection.
+  // Serving the persisted last-used pair is therefore the ONLY way model+mode survive a
+  // restart. Fresh read per GET so long-lived --serve instances and sibling projects see
+  // each other's updates; invalid persisted values degrade to the stock catalog.
+  app.get("/agent", async (c) => c.json(orderedAgents((await store.globalDefaults()).agent)))
+  app.get("/config", async (c) => c.json({ model: validModelRef((await store.globalDefaults()).model) ?? DEFAULT_MODEL_REF }))
 
   /** Owning root = longest of (primary, copies) that string-contains the directory, or null.
    *  Exact string containment — paths are byte-stable across the API (doc 08 note 9). */
@@ -392,6 +398,21 @@ export function createApp(store: Store) {
     if (session?.model?.id) return { providerID: session.model.providerID ?? "anthropic", modelID: session.model.id, variant: session.model.variant }
     return { providerID: "anthropic", modelID: DEFAULT_MODEL, variant: body.variant }
   }
+
+  /** Record the turn's model/agent as the global launch defaults (served back by /config
+   *  + /agent above). Only values the CLIENT sent count — the TUI re-sends its picker
+   *  selection with every prompt/command, which is exactly the "current" pair — never the
+   *  session/catalog fallbacks. Values that don't map to the catalog are dropped so an
+   *  API caller's typo can't corrupt the boot default. Fire-and-forget: the settings
+   *  write must never sit on the prompt path. */
+  const noteDefaults = (session: any, modelRef: string | undefined, agent: unknown) => {
+    if (session?.parentID) return // subagent children inherit their parent's choices
+    const patch: { model?: string; agent?: string } = {}
+    const model = validModelRef(modelRef)
+    if (model) patch.model = model
+    if (typeof agent === "string" && AGENTS.some((a) => a.name === agent)) patch.agent = agent
+    if (patch.model || patch.agent) void store.noteDefaults(patch)
+  }
   const textOf = (parts: any[]): string =>
     (parts ?? [])
       .filter((p) => p?.type === "text" && !p.synthetic && p.text)
@@ -412,6 +433,7 @@ export function createApp(store: Store) {
     const body = await safeBody(c)
     const agent = body.agent ?? session.agent ?? "build"
     const model = resolveModel(body, session)
+    noteDefaults(session, body.model?.modelID ? `${body.model.providerID ?? "anthropic"}/${body.model.modelID}` : undefined, body.agent)
     const text = textOf(body.parts)
     const engine = engineFor(id, agent)
     if (body.noReply) {
@@ -435,6 +457,7 @@ export function createApp(store: Store) {
     const body = await safeBody(c)
     const agent = body.agent ?? session.agent ?? "build"
     const model = resolveModel(body, session)
+    noteDefaults(session, body.model?.modelID ? `${body.model.providerID ?? "anthropic"}/${body.model.modelID}` : undefined, body.agent)
     const text = textOf(body.parts)
     if (body.noReply) {
       const user = store.newUserMessage(id, agent, model)
@@ -465,6 +488,7 @@ export function createApp(store: Store) {
       slash > 0
         ? { providerID: body.model.slice(0, slash), modelID: body.model.slice(slash + 1), variant: body.variant }
         : { ...base, variant: body.variant ?? base.variant }
+    noteDefaults(session, slash > 0 ? body.model : undefined, body.agent)
     const args = typeof body.arguments === "string" ? body.arguments : ""
     // Bare /config: render current settings from disk instead of forwarding — headless the
     // CLI can only print its usage dump (09 §6). Intercepted BEFORE the name validation so
