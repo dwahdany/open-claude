@@ -3,13 +3,6 @@
 Run the **opencode** frontend (its TUI, and by extension its web/desktop clients) on top
 of a **Claude Code** backend.
 
-opencode has a strict client/server split: every frontend is a thin client of a local
-HTTP + SSE API, and `opencode attach <url>` points the stock TUI at any server that speaks
-that API. `open-claude` is that server — it reimplements the opencode v1.17.19 wire
-contract and drives the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
-(the real Claude Code engine) underneath. So you get opencode's renderer with Claude Code's
-agent, prompts, tools, and permission model.
-
 ```
 ┌────────────────┐  HTTP + SSE (opencode API)  ┌──────────────┐   stream-json   ┌─────────────┐
 │ opencode TUI   │ ───────────────────────────▶│  open-claude │ ───────────────▶│ Claude Code │
@@ -17,6 +10,40 @@ agent, prompts, tools, and permission model.
 └────────────────┘    server.connected /        └──────────────┘   SDK messages  └─────────────┘
                       message.* / permission.*
 ```
+
+![The stock opencode TUI home screen, attached to open-claude, with a Claude model in the slot](docs/hero.png)
+
+## Features
+
+- **Stock opencode UI, real Claude Code engine** — the agent, system prompts, tools, and
+  permission model are Claude Code's own, driven through the Claude Agent SDK.
+- **One command** — `bunx @dwahdany/open-claude` starts the server and drops you into the
+  attached TUI.
+- **Full round-trip** — streaming text and reasoning, per-tool render views, cost/context
+  gauges, Esc-Esc interrupts, mid-session model and agent switching.
+- **Permissions bridged** — Claude Code's tool gate surfaces as opencode's permission
+  dialog and replies round-trip to the engine.
+- **Agents and effort variants** — Tab through `build`/`plan`/`auto`; pick low→max
+  reasoning effort or `ultracode` from the variant picker.
+- **Subagents and workflows as child sessions** — Task runs mirror into navigable child
+  transcripts; `Workflow` runs stream a live phase/agent progress log.
+- **Interactive questions** — `AskUserQuestion` becomes opencode's question dialog, with
+  option previews and a free-text Notes tab.
+- **`/config` and `/model` views, session resume** — instant read-only settings and model
+  views; reopening a session replays its transcript.
+
+## How it works
+
+opencode has a strict client/server split: every frontend is a thin client of a local
+HTTP + SSE API, and `opencode attach <url>` points the stock TUI at any server that speaks
+that API. `open-claude` is that server — it reimplements the opencode v1.17.19 wire
+contract and drives the [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
+(the real Claude Code engine) underneath. So you get opencode's renderer with Claude Code's
+agent, prompts, tools, and permission model.
+
+![Claude answering "what model are you and in what harness?" inside the opencode TUI](docs/claude-code.png)
+
+*opencode's renderer, Claude Code's agent — ask it yourself.*
 
 ## Requirements
 
@@ -66,7 +93,7 @@ set `OPENCLAUDE_NO_ALIAS_PROMPT=1` to suppress the offer entirely.
 | Env var | Effect |
 |---|---|
 | `OPENCLAUDE_SETTING_SOURCES=none` | Ignore your `~/.claude` allowlists so **every** gated tool routes through opencode's permission dialog (clean-room prompts). Default: load your Claude Code settings, matching normal Claude Code behavior. |
-| `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. |
+| `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. The `ultracode` entry in the variant picker does the same for a single session. |
 | `OPENCLAUDE_NO_ALIAS_PROMPT=1` | Never offer the first-run `oclaude` shell alias. |
 | `OPENCLAUDE_NO_UPDATE_CHECK=1` | Never check npm for a newer version. |
 | `OPENCLAUDE_NO_QUESTION_NOTES=1` | Drop the synthetic "Notes" tab from question dialogs — restores one-keystroke submit on single questions; free text is still available via "Type your own answer". |
@@ -95,10 +122,17 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
 - **Agents** (Tab to cycle): `build` (default mode), `plan` (plan mode), `auto` (Claude Code's
   `auto` permission mode — a model classifier handles permission prompts; anything it escalates
   still surfaces as an opencode permission dialog).
+
+  <img src="docs/automode.png" alt="The prompt footer in auto mode: Auto · Claude Fable 5 · max" width="600">
+
 - **Reasoning effort**: the model variant picker (low/medium/high/xhigh/max) maps to Agent SDK
-  `effort`. First pick applies at query start; later changes apply mid-session via the
+  `effort`; an extra `ultracode` entry is the per-session form of `OPENCLAUDE_ULTRACODE=1`.
+  First pick applies at query start; later changes apply mid-session via the
   flag-settings layer (which has no `max` member, so `max` picked after turn 1 clamps to `xhigh`;
   reverting to "no variant" falls back to the session's initial effort, not the global default).
+
+  <img src="docs/ultracode.png" alt="The variant picker: Default, low through max, and ultracode" width="600">
+
 - **Mid-session switching**: model and build↔plan agent changes on later turns ride
   `setModel`/`setPermissionMode`; turns are serialized per session; Esc-Esc aborts map to
   `MessageAbortedError` (no error toast) and in-flight tool parts are errored out. The TUI's
