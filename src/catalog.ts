@@ -44,12 +44,15 @@ function model(
 // The TUI only reads the keys for its variant picker; the values carry no options.
 const EFFORT_VARIANTS = { low: {}, medium: {}, high: {}, xhigh: {}, max: {}, ultracode: {} }
 
+// limit values are what the Claude Code CLI itself reports for this auth
+// (result.modelUsage contextWindow/maxOutputTokens — test/probe-usage.ts); the TUI's
+// context % divides the last assistant message's tokens by limit.context.
 export const MODELS: Record<string, ReturnType<typeof model>> = {
   "claude-opus-4-8": model(
     "claude-opus-4-8",
     "Claude Opus 4.8",
     { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
-    { context: 200000, output: 64000 },
+    { context: 1000000, output: 64000 },
     "2026-05-01",
     EFFORT_VARIANTS,
   ),
@@ -57,7 +60,7 @@ export const MODELS: Record<string, ReturnType<typeof model>> = {
     "claude-fable-5",
     "Claude Fable 5",
     { input: 5, output: 25, cache: { read: 0.5, write: 6.25 } },
-    { context: 200000, output: 64000 },
+    { context: 1000000, output: 64000 },
     "2026-06-01",
     EFFORT_VARIANTS,
   ),
@@ -73,7 +76,7 @@ export const MODELS: Record<string, ReturnType<typeof model>> = {
     "claude-haiku-4-5-20251001",
     "Claude Haiku 4.5",
     { input: 1, output: 5, cache: { read: 0.1, write: 1.25 } },
-    { context: 200000, output: 64000 },
+    { context: 200000, output: 32000 },
     "2025-10-01",
   ),
 }

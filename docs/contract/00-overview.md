@@ -277,7 +277,10 @@ order-insensitive for steps 1-3 but strict about 4-before-5 and part-before-delt
     + message.updated      {info:{...msg_B, finish, cost, tokens}}   <- after each step
     -- turn end --
 18. message.updated        {info:{...msg_B, time:{created, completed:<now>}, finish:"stop",
-                            cost:<total_cost_usd>, tokens:<final usage>}}
+                            cost:<total_cost_usd>, tokens:<LAST step's usage — the current
+                            context. NOT the SDK result.usage, which sums every API call in
+                            the turn and overstates context by N× (test/probe-usage.ts); the
+                            TUI context %% = this msg's token total / model limit.context>}}
 19. session.updated        {sessionID, info:<Session with updated title/time.updated/tokens/cost>}
 20. session.status         {sessionID, status:{type:"idle"}}
 21. session.idle           {sessionID}          (deprecated, TUI ignores; emit for parity)

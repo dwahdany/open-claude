@@ -625,6 +625,14 @@ export class SessionEngine {
     switch (event.type) {
       case "message_start": {
         this.blocks.clear()
+        // Seed this API call's usage: input+cache arrive here, output accrues via message_delta.
+        const u = event.message?.usage ?? {}
+        this.stepTokens = {
+          input: u.input_tokens ?? 0,
+          output: u.output_tokens ?? 0,
+          reasoning: 0,
+          cache: { read: u.cache_read_input_tokens ?? 0, write: u.cache_creation_input_tokens ?? 0 },
+        }
         this.putPart(this.store.newPart(this.sessionID, A.id, { type: "step-start" }))
         break
       }
@@ -687,7 +695,10 @@ export class SessionEngine {
           input: u.input_tokens ?? this.stepTokens.input,
           output: u.output_tokens ?? this.stepTokens.output,
           reasoning: 0,
-          cache: { read: u.cache_read_input_tokens ?? 0, write: u.cache_creation_input_tokens ?? 0 },
+          cache: {
+            read: u.cache_read_input_tokens ?? this.stepTokens.cache.read,
+            write: u.cache_creation_input_tokens ?? this.stepTokens.cache.write,
+          },
         }
         break
       }
@@ -922,12 +933,20 @@ export class SessionEngine {
     const aborted = String(msg.terminal_reason ?? "").startsWith("aborted")
     if (A) {
       A.cost = msg.total_cost_usd ?? A.cost
-      const u = msg.usage ?? {}
-      A.tokens = {
-        input: u.input_tokens ?? A.tokens.input,
-        output: u.output_tokens ?? A.tokens.output,
-        reasoning: 0,
-        cache: { read: u.cache_read_input_tokens ?? 0, write: u.cache_creation_input_tokens ?? 0 },
+      // result.usage is SUMMED over every API call in the turn (test/probe-usage.ts): each
+      // tool round-trip re-reads the whole cached context, so cache.read alone stacks to
+      // N× the real context and the TUI's gauge reads >1000%. A.tokens already holds the
+      // LAST call's usage (message_start/delta → message_stop snapshot) — that IS the
+      // current context, and it's what upstream stores too (message.tokens = final step's
+      // usage, vendor processor.ts:445). Use the summed result only if nothing streamed.
+      if (A.tokens.input + A.tokens.output + A.tokens.cache.read + A.tokens.cache.write === 0) {
+        const u = msg.usage ?? {}
+        A.tokens = {
+          input: u.input_tokens ?? 0,
+          output: u.output_tokens ?? 0,
+          reasoning: 0,
+          cache: { read: u.cache_read_input_tokens ?? 0, write: u.cache_creation_input_tokens ?? 0 },
+        }
       }
       A.time.completed = Date.now()
       A.finish = msg.subtype === "success" && !aborted ? "stop" : "error"
