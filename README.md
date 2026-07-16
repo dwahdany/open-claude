@@ -96,7 +96,6 @@ set `OPENCLAUDE_NO_ALIAS_PROMPT=1` to suppress the offer entirely.
 | `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. The `ultracode` entry in the variant picker does the same for a single session. |
 | `OPENCLAUDE_NO_ALIAS_PROMPT=1` | Never offer the first-run `oclaude` shell alias. |
 | `OPENCLAUDE_NO_UPDATE_CHECK=1` | Never check npm for a newer version. |
-| `OPENCLAUDE_NO_QUESTION_NOTES=1` | Drop the synthetic "Notes" tab from question dialogs — restores one-keystroke submit on single questions; free text is still available via "Type your own answer". |
 
 ### Updating
 
@@ -148,12 +147,13 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
   (`task_progress` ticks, with `agentProgressSummaries` AI status lines, closed by the
   completion summary). Requires the account-gated Workflows feature.
 - **Questions**: `AskUserQuestion` maps to opencode's question dialog; selected labels return
-  to the model via `updatedInput.answers`. Option **previews** (mockups, code snippets) fold
-  into the option description as quote-barred lines (line-budgeted so the dialog can't outgrow
-  the terminal, which would clip with no scroll). A trailing **Notes** tab lets you attach a
-  free-text note to your answer — it returns via `updatedInput.annotations`, which the CLI
-  renders into the tool result (` notes: …`), and shows in the transcript as `note: …`.
-  Disable with `OPENCLAUDE_NO_QUESTION_NOTES=1`.
+  to the model via `updatedInput.answers`. Option **previews** (mockups, code snippets) render
+  in the transcript right above the dialog as fenced markdown — scrollable and unbounded,
+  unlike the dialog itself, which would clip. To attach a **note** to an answer, type it via
+  "Type your own answer" with a ` // ` delimiter: `Apples // only organic` answers "Apples"
+  with a note, and a `// just a note` entry in multi-select notes your toggled labels. Notes
+  return via `updatedInput.annotations` per question — the CLI renders them into the tool
+  result (` notes: …`) and the transcript shows `note: …`.
 - **`/config`**: bare `/config` renders your current Claude Code settings (with the file each
   value comes from) instantly in the transcript — headless, the CLI could only print its usage
   dump. `/config key=value` still passes through to the CLI and persists.
@@ -170,11 +170,13 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
 - `test/subagent-session.ts` — Task subagent → child session over SSE, task part linked via
   `metadata.sessionId`, child transcript fetchable, busy→idle lifecycle.
 - `test/question-bridge.ts` — AskUserQuestion → `question.asked` → reply → answer reaches the model.
-- `test/live-question-notes.ts` — option previews fold into descriptions (quote-barred, budget-clamped,
-  raw `preview` on the wire), Notes tab note returns via `updatedInput.annotations` and lands in the
-  tool_result + transcript metadata, "No note"/loose reply shapes/kill-switch all round-trip.
-- `test/pty_question.py` — the real TUI renders folded previews and the Notes tab; a typed note
-  round-trips on-screen (CLI-side contract in `test/probe-question-annotations.ts`).
+- `test/live-question-notes.ts` — option previews become a fenced-markdown transcript part
+  (raw `preview` still on the wire), ` // ` delimiter notes return via `updatedInput.annotations`
+  per question and land in the tool_result + transcript metadata, pure-note multi-select
+  entries and loose reply shapes all round-trip.
+- `test/pty_question.py` — the real TUI renders previews in the transcript above a compact
+  dialog; a delimiter note round-trips on-screen (CLI-side contract in
+  `test/probe-question-annotations.ts`).
 - `test/live-model-sync.ts` — `/model` intercept (read-only view, session never busy) and
   model-drift self-heal: a raw `/model` passthrough flips the CLI, the drifted turn's message
   is restamped with the serving model, the next turn re-asserts the picker's choice

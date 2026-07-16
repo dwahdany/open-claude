@@ -40,8 +40,7 @@ Env:
   OPENCLAUDE_SETTING_SOURCES=none  ignore ~/.claude allowlists (prompt for every tool)
   OPENCLAUDE_ULTRACODE=1           enable ultracode (needs workflows + xhigh model)
   OPENCLAUDE_NO_ALIAS_PROMPT=1     never offer the first-run \`oclaude\` shell alias
-  OPENCLAUDE_NO_UPDATE_CHECK=1     never check npm for a newer version
-  OPENCLAUDE_NO_QUESTION_NOTES=1   drop the extra "Notes" tab on question dialogs`)
+  OPENCLAUDE_NO_UPDATE_CHECK=1     never check npm for a newer version`)
   process.exit(0)
 }
 

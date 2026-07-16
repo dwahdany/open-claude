@@ -72,24 +72,50 @@ interface PendingQuestion {
   resolve: (r: PermissionResult) => void
   input: Record<string, unknown>
   request: QuestionRequest
-  notes: boolean // a synthetic trailing "Notes" question was appended to request.questions
 }
 
 // The stock TUI question dialog renders only {label, description} per option and has no
-// notes affordance. Previews fold into the description (the TUI renders \n and word-wraps,
-// but a dialog taller than the terminal bottom-clips with no scroll — hence a line budget
-// per question, split across options that carry previews).
-const PREVIEW_LINE_BUDGET = 24
-const NOTES_HEADER = "Notes"
-const NO_NOTE_LABEL = "No note"
+// notes affordance — and the dialog bottom-clips past terminal height with no scroll, so
+// previews don't belong in it. Previews render as a synthetic TRANSCRIPT text part instead
+// (markdown, scrollable, unbounded); notes ride the dialog's own free-text row via the
+// " // " delimiter (see splitNotes).
 
-/** Quote-bar each preview line under the description, clamped to maxLines. */
-export function foldPreview(description: string, preview: string, maxLines: number): string {
-  const lines = preview.trimEnd().split("\n")
-  const shown = lines.length > maxLines ? lines.slice(0, Math.max(1, maxLines - 1)) : lines
-  const quoted = shown.map((l) => `│ ${l}`)
-  if (shown.length < lines.length) quoted.push(`│ … (+${lines.length - shown.length} more preview lines)`)
-  return description ? `${description}\n${quoted.join("\n")}` : quoted.join("\n")
+/** Split one dialog answer array into clean answers + an attached note. A typed entry
+ *  "answer // note" attaches a note; an entry that is just "// note" is a pure note
+ *  (multi-select: it rides alongside the toggled labels). Entries exactly matching a
+ *  picked option label pass through verbatim — only typed custom text is parsed, so a
+ *  model-authored label may safely contain the delimiter. Both note forms require the
+ *  space-padded delimiter, so URLs ("https://…", "//cdn.example.com") stay answers. */
+export function splitNotes(entries: string[], labels?: ReadonlySet<string>): { answers: string[]; note: string } {
+  const answers: string[] = []
+  const notes: string[] = []
+  for (const raw of entries) {
+    if (labels?.has(raw)) {
+      answers.push(raw)
+      continue
+    }
+    const t = raw.trim()
+    if (t === "//") continue
+    if (t.startsWith("// ")) {
+      const n = t.slice(3).trim()
+      if (n) notes.push(n)
+      continue
+    }
+    const idx = raw.indexOf(" // ")
+    if (idx >= 0) {
+      const answer = raw.slice(0, idx).trim()
+      const note = raw.slice(idx + 4).trim()
+      if (answer) answers.push(answer)
+      if (note) notes.push(note)
+    } else answers.push(raw)
+  }
+  return { answers, note: notes.join("\n") }
+}
+
+/** Markdown code fence long enough to contain `s` (previews may themselves hold ``` blocks). */
+function fenceFor(s: string): string {
+  const longest = (s.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 2)
+  return "`".repeat(longest + 1)
 }
 
 interface BlockCtx {
@@ -157,6 +183,7 @@ export class SessionEngine {
   private pendingPermissions = new Map<string, PendingPermission>()
   private alwaysAllow = new Set<string>()
   private pendingQuestions = new Map<string, PendingQuestion>()
+  private previewEmitted = new Set<string>() // question tool_use ids whose preview part was already synthesized (re-asks must not duplicate it)
 
   constructor(
     private store: Store,
@@ -414,31 +441,33 @@ export class SessionEngine {
   private askQuestion(input: Record<string, unknown>, toolUseID: string, signal?: AbortSignal): Promise<PermissionResult> {
     const raw = Array.isArray(input.questions) ? (input.questions as Record<string, unknown>[]) : []
     const hasPreview = (o: Record<string, unknown>): boolean => typeof o?.preview === "string" && o.preview.trim() !== ""
-    const questions: QuestionInfo[] = raw.map((q) => {
-      const opts = Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : []
-      const previews = opts.filter(hasPreview).length
-      const budget = previews ? Math.max(3, Math.floor(PREVIEW_LINE_BUDGET / previews)) : 0
-      return {
-        question: String(q?.question ?? ""),
-        header: String(q?.header ?? ""),
-        options: opts.map((o) => {
-          const label = String(o?.label ?? "")
-          const description = String(o?.description ?? "")
-          const preview = hasPreview(o) ? (o.preview as string) : undefined
-          return preview ? { label, description: foldPreview(description, preview, budget), preview } : { label, description }
-        }),
-        multiple: q?.multiSelect === true,
+    const questions: QuestionInfo[] = raw.map((q) => ({
+      question: String(q?.question ?? ""),
+      header: String(q?.header ?? ""),
+      options: (Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : []).map((o) => ({
+        label: String(o?.label ?? ""),
+        description: String(o?.description ?? ""),
+        // not in the vendor schema; the TUI provably ignores it, other clients may render it
+        ...(hasPreview(o) ? { preview: o.preview as string } : {}),
+      })),
+      multiple: q?.multiSelect === true,
+    }))
+    // Previews render as a synthetic transcript part right above the dialog: the transcript
+    // is a scrollable markdown surface, so previews get fenced code blocks and unbounded
+    // length instead of being crammed into the bottom-clipping dialog.
+    const blocks: string[] = []
+    for (const q of questions)
+      for (const o of q.options) {
+        if (!o.preview) continue
+        const fence = fenceFor(o.preview)
+        blocks.push(`**${questions.length > 1 && q.header ? `${q.header} · ` : ""}${o.label}**\n${fence}\n${o.preview}\n${fence}`)
       }
-    })
-    const notes = process.env.OPENCLAUDE_NO_QUESTION_NOTES !== "1" && questions.length > 0
-    if (notes)
-      questions.push({
-        question: "Add a note to your answer? (optional)",
-        // dodge a duplicate tab label when the model's own question is headed "Notes"
-        header: questions.some((q) => q.header.trim().toLowerCase() === "notes") ? "Your note" : NOTES_HEADER,
-        options: [{ label: NO_NOTE_LABEL, description: "Send the answer as-is" }],
-        multiple: false,
-      })
+    if (blocks.length && this.assistant && !this.previewEmitted.has(toolUseID)) {
+      this.previewEmitted.add(toolUseID)
+      const now = Date.now()
+      const text = `${blocks.join("\n\n")}\n\n*(attach a note to any typed answer with \`answer // note\`)*`
+      this.store.putPart(this.sessionID, this.store.newPart(this.sessionID, this.assistant.id, { type: "text", text, time: { start: now, end: now } }))
+    }
     const request: QuestionRequest = {
       id: Id.question(),
       sessionID: this.sessionID,
@@ -446,7 +475,7 @@ export class SessionEngine {
       tool: { messageID: this.assistant?.id ?? "", callID: toolUseID },
     }
     const deferred = defer<PermissionResult>()
-    this.pendingQuestions.set(request.id, { resolve: deferred.resolve, input, request, notes })
+    this.pendingQuestions.set(request.id, { resolve: deferred.resolve, input, request })
     signal?.addEventListener("abort", () => this.rejectQuestion(request.id), { once: true })
     this.store.bus.publish("question.asked", { ...request })
     return deferred.promise
@@ -465,36 +494,25 @@ export class SessionEngine {
     )
     this.store.bus.publish("question.replied", { sessionID: this.sessionID, requestID, answers })
     const questions = pending.request.questions
-    const asked = pending.notes ? questions.length - 1 : questions.length // questions the model actually asked
-    const note = pending.notes
-      ? (answers[asked] ?? [])
-          .filter((a) => a && a !== NO_NOTE_LABEL)
-          .join("\n")
-          .trim()
-      : ""
-    // Anchor the note to the first ANSWERED question — the CLI renders annotations right
-    // after that question's answer in the tool_result, so an unanswered anchor could drop it.
-    const anchor = Math.max(0, Array.from({ length: asked }, (_, i) => i).findIndex((i) => (answers[i] ?? []).length > 0))
+    const byQuestion: Record<string, string> = {}
+    const annotations: Record<string, { notes: string }> = {}
     // The TUI's question tool renderer reads metadata.answers (string[][]) from the tool part,
-    // iterating the model's ORIGINAL questions — so the synthetic Notes answer is stripped and
-    // the note appended to the anchor answer (extra strings render joined with ", ").
-    const metaAnswers = Array.from({ length: asked }, (_, i) => [...(answers[i] ?? [])])
-    if (note) metaAnswers[anchor]?.push(`note: ${note}`)
+    // iterating the model's original questions; extra strings render joined with ", ".
+    const metaAnswers: string[][] = []
+    questions.forEach((q, i) => {
+      const { answers: clean, note } = splitNotes(answers[i] ?? [], new Set(q.options.map((o) => o.label)))
+      if (clean.length) byQuestion[q.question] = clean.join(", ")
+      // Notes ride updatedInput.annotations per question: the CLI renders each as
+      // ` notes: <text>` right after that question's answer in the tool_result
+      // (probe-verified, test/probe-question-annotations.ts).
+      if (note) annotations[q.question] = { notes: note }
+      metaAnswers.push(note ? [...clean, `note: ${note}`] : clean)
+    })
     const toolCtx = pending.request.tool ? this.tools.get(pending.request.tool.callID) : undefined
     if (toolCtx) toolCtx.extraMeta = { ...toolCtx.extraMeta, answers: metaAnswers }
-    const byQuestion: Record<string, string> = {}
-    questions.slice(0, asked).forEach((q, i) => {
-      const a = answers[i] ?? []
-      if (a.length) byQuestion[q.question] = a.join(", ")
-    })
-    // The note rides updatedInput.annotations: the CLI renders it in the tool_result as
-    // ` notes: <text>` after the anchor question's answer (probe-verified,
-    // test/probe-question-annotations.ts).
-    const anchorQuestion = questions[anchor]?.question
-    const annotations = note && anchorQuestion !== undefined ? { [anchorQuestion]: { notes: note } } : undefined
     pending.resolve({
       behavior: "allow",
-      updatedInput: { ...pending.input, answers: byQuestion, ...(annotations ? { annotations } : {}) },
+      updatedInput: { ...pending.input, answers: byQuestion, ...(Object.keys(annotations).length ? { annotations } : {}) },
     })
     return true
   }
