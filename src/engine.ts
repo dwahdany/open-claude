@@ -407,9 +407,10 @@ export class SessionEngine {
 
   private askQuestion(input: Record<string, unknown>, toolUseID: string, signal?: AbortSignal): Promise<PermissionResult> {
     const raw = Array.isArray(input.questions) ? (input.questions as Record<string, unknown>[]) : []
+    const hasPreview = (o: Record<string, unknown>): boolean => typeof o?.preview === "string" && o.preview.trim() !== ""
     const questions: QuestionInfo[] = raw.map((q) => {
       const opts = Array.isArray(q?.options) ? (q.options as Record<string, unknown>[]) : []
-      const previews = opts.filter((o) => typeof o?.preview === "string" && o.preview !== "").length
+      const previews = opts.filter(hasPreview).length
       const budget = previews ? Math.max(3, Math.floor(PREVIEW_LINE_BUDGET / previews)) : 0
       return {
         question: String(q?.question ?? ""),
@@ -417,7 +418,7 @@ export class SessionEngine {
         options: opts.map((o) => {
           const label = String(o?.label ?? "")
           const description = String(o?.description ?? "")
-          const preview = typeof o?.preview === "string" && o.preview !== "" ? o.preview : undefined
+          const preview = hasPreview(o) ? (o.preview as string) : undefined
           return preview ? { label, description: foldPreview(description, preview, budget), preview } : { label, description }
         }),
         multiple: q?.multiSelect === true,
@@ -427,7 +428,8 @@ export class SessionEngine {
     if (notes)
       questions.push({
         question: "Add a note to your answer? (optional)",
-        header: NOTES_HEADER,
+        // dodge a duplicate tab label when the model's own question is headed "Notes"
+        header: questions.some((q) => q.header.trim().toLowerCase() === "notes") ? "Your note" : NOTES_HEADER,
         options: [{ label: NO_NOTE_LABEL, description: "Send the answer as-is" }],
         multiple: false,
       })
@@ -449,6 +451,12 @@ export class SessionEngine {
     const pending = this.pendingQuestions.get(requestID)
     if (!pending) return false
     this.pendingQuestions.delete(requestID)
+    // Clients other than the TUI may send loose shapes (a bare string where a one-entry
+    // array belongs); a throw past this point would strand the CLI's canUseTool promise
+    // and hang the turn, so normalize before touching anything.
+    answers = (Array.isArray(answers) ? answers : []).map((a) =>
+      Array.isArray(a) ? a.filter((x): x is string => typeof x === "string") : typeof a === "string" ? [a] : [],
+    )
     this.store.bus.publish("question.replied", { sessionID: this.sessionID, requestID, answers })
     const questions = pending.request.questions
     const asked = pending.notes ? questions.length - 1 : questions.length // questions the model actually asked
@@ -458,11 +466,14 @@ export class SessionEngine {
           .join("\n")
           .trim()
       : ""
+    // Anchor the note to the first ANSWERED question — the CLI renders annotations right
+    // after that question's answer in the tool_result, so an unanswered anchor could drop it.
+    const anchor = Math.max(0, Array.from({ length: asked }, (_, i) => i).findIndex((i) => (answers[i] ?? []).length > 0))
     // The TUI's question tool renderer reads metadata.answers (string[][]) from the tool part,
     // iterating the model's ORIGINAL questions — so the synthetic Notes answer is stripped and
-    // the note appended to the first answer (extra strings render joined with ", ").
+    // the note appended to the anchor answer (extra strings render joined with ", ").
     const metaAnswers = Array.from({ length: asked }, (_, i) => [...(answers[i] ?? [])])
-    if (note) metaAnswers[0]?.push(`note: ${note}`)
+    if (note) metaAnswers[anchor]?.push(`note: ${note}`)
     const toolCtx = pending.request.tool ? this.tools.get(pending.request.tool.callID) : undefined
     if (toolCtx) toolCtx.extraMeta = { ...toolCtx.extraMeta, answers: metaAnswers }
     const byQuestion: Record<string, string> = {}
@@ -470,11 +481,11 @@ export class SessionEngine {
       const a = answers[i] ?? []
       if (a.length) byQuestion[q.question] = a.join(", ")
     })
-    // The note rides updatedInput.annotations on the first question: the CLI renders it in the
-    // tool_result as ` notes: <text>` right after that question's answer (probe-verified,
+    // The note rides updatedInput.annotations: the CLI renders it in the tool_result as
+    // ` notes: <text>` after the anchor question's answer (probe-verified,
     // test/probe-question-annotations.ts).
-    const firstQuestion = questions[0]?.question
-    const annotations = note && firstQuestion !== undefined ? { [firstQuestion]: { notes: note } } : undefined
+    const anchorQuestion = questions[anchor]?.question
+    const annotations = note && anchorQuestion !== undefined ? { [anchorQuestion]: { notes: note } } : undefined
     pending.resolve({
       behavior: "allow",
       updatedInput: { ...pending.input, answers: byQuestion, ...(annotations ? { annotations } : {}) },

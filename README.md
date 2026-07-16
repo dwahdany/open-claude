@@ -128,6 +128,11 @@ registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disabl
 - `test/subagent-session.ts` — Task subagent → child session over SSE, task part linked via
   `metadata.sessionId`, child transcript fetchable, busy→idle lifecycle.
 - `test/question-bridge.ts` — AskUserQuestion → `question.asked` → reply → answer reaches the model.
+- `test/live-question-notes.ts` — option previews fold into descriptions (quote-barred, budget-clamped,
+  raw `preview` on the wire), Notes tab note returns via `updatedInput.annotations` and lands in the
+  tool_result + transcript metadata, "No note"/loose reply shapes/kill-switch all round-trip.
+- `test/pty_question.py` — the real TUI renders folded previews and the Notes tab; a typed note
+  round-trips on-screen (CLI-side contract in `test/probe-question-annotations.ts`).
 - `test/workflow-render.ts` — Workflow run → task part linked to a child session with a live
   progress log, busy→idle on completion.
 - `test/sdk-subagent-probe.ts` — documents how the SDK forwards subagent content (complete
