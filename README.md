@@ -68,6 +68,22 @@ set `OPENCLAUDE_NO_ALIAS_PROMPT=1` to suppress the offer entirely.
 | `OPENCLAUDE_SETTING_SOURCES=none` | Ignore your `~/.claude` allowlists so **every** gated tool routes through opencode's permission dialog (clean-room prompts). Default: load your Claude Code settings, matching normal Claude Code behavior. |
 | `OPENCLAUDE_ULTRACODE=1` | Enable Claude Code's ultracode mode (`Settings.ultracode`): xhigh effort plus standing workflow orchestration. Only takes effect when your account has workflows enabled and the model supports xhigh. |
 | `OPENCLAUDE_NO_ALIAS_PROMPT=1` | Never offer the first-run `oclaude` shell alias. |
+| `OPENCLAUDE_NO_UPDATE_CHECK=1` | Never check npm for a newer version. |
+
+### Updating
+
+open-claude updates through whatever runs it — there is no self-updater, by design:
+
+| How you run it | Update with |
+|---|---|
+| Global install | `bun add -g @dwahdany/open-claude@latest` (or `npm i -g …@latest`) |
+| `bunx` / `npx` | `bunx @dwahdany/open-claude@latest` — the bare spec reuses the cached copy, so pass `@latest` when you want the newest |
+| Source checkout | `git pull` |
+
+At most once a day (interactive runs only) open-claude asks npm whether a newer version
+exists and prints a one-line notice with the command matching your launch mode — in serve
+logs, or after the TUI hands the terminal back, never during a session. Offline or slow
+registries are ignored silently. `OPENCLAUDE_NO_UPDATE_CHECK=1` (or `CI`) disables it.
 
 ## What works
 

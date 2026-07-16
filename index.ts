@@ -6,6 +6,7 @@
 import { offerAliasOnFirstRun } from "./src/alias"
 import { createApp } from "./src/server"
 import { Store } from "./src/store"
+import { checkForUpdate } from "./src/update"
 
 const OPENCODE_PIN = "1.17.19"
 
@@ -38,7 +39,8 @@ Requires the opencode CLI v${OPENCODE_PIN} (https://opencode.ai) and Claude auth
 Env:
   OPENCLAUDE_SETTING_SOURCES=none  ignore ~/.claude allowlists (prompt for every tool)
   OPENCLAUDE_ULTRACODE=1           enable ultracode (needs workflows + xhigh model)
-  OPENCLAUDE_NO_ALIAS_PROMPT=1     never offer the first-run \`oclaude\` shell alias`)
+  OPENCLAUDE_NO_ALIAS_PROMPT=1     never offer the first-run \`oclaude\` shell alias
+  OPENCLAUDE_NO_UPDATE_CHECK=1     never check npm for a newer version`)
   process.exit(0)
 }
 
@@ -75,6 +77,10 @@ const url = `http://${urlHost}:${server.port}`
 console.log(`open-claude listening on ${url}`)
 console.log(`  directory: ${directory}`)
 
+// Background npm release check (throttled to one per day; never throws). Printed only
+// where it cannot corrupt the TUI: serve-mode logs, or after the TUI returns the terminal.
+const updateNotice = checkForUpdate()
+
 // Attaching is the default; --serve/--no-attach opts out, a non-TTY (pipes, CI) implies it,
 // and a missing opencode CLI degrades to serve-only instead of failing. --attach is a
 // legacy no-op alias from when serve-only was the default.
@@ -106,7 +112,13 @@ if (!serveOnly && found !== null) {
   })
   const code = await tui.exited
   server.stop(true)
+  // Settled long ago in any real session; the race caps a TUI that exits within seconds of boot.
+  const notice = await Promise.race([updateNotice, new Promise<null>((r) => setTimeout(() => r(null), 250))])
+  if (notice) console.log(notice)
   process.exit(code)
 } else {
   console.log(`  attach with: opencode attach ${url}`)
+  void updateNotice.then((notice) => {
+    if (notice) console.log(notice)
+  })
 }
